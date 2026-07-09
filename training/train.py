@@ -4,7 +4,7 @@ from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
-from crustle_agent import agent as crustle_agent_fn
+from crustle_agent.crustle_agent import agent as crustle_agent_fn
 from training.cabt_env import CabtEnv
 
 # Each worker runs the native game engine in its own OS process, since
@@ -20,7 +20,7 @@ N_ENVS = int(os.environ.get("N_ENVS", max(1, (os.cpu_count() or 4) - 2)))
 # Split workers between pure self-play (free exploration, both sides RL) and
 # a fixed heuristic opponent (directly optimizes for beating the known
 # baseline). Must sum to N_ENVS.
-N_SELFPLAY_ENVS = N_ENVS // 2
+N_SELFPLAY_ENVS = N_ENVS // 6
 N_HEURISTIC_ENVS = N_ENVS - N_SELFPLAY_ENVS
 
 # Keep total samples collected per policy update roughly constant regardless
@@ -48,7 +48,9 @@ def make_heuristic_env():
 
 
 if __name__ == "__main__":
-    env_fns = [make_selfplay_env] * N_SELFPLAY_ENVS + [make_heuristic_env] * N_HEURISTIC_ENVS
+    env_fns = [make_selfplay_env] * N_SELFPLAY_ENVS + [
+        make_heuristic_env
+    ] * N_HEURISTIC_ENVS
     env = SubprocVecEnv(env_fns)
 
     model = MaskablePPO(
@@ -63,5 +65,9 @@ if __name__ == "__main__":
         tensorboard_log="./ppo_cabt_logs/",
     )
 
+<<<<<<< HEAD
     model.learn(total_timesteps=1_000_00)
+=======
+    model.learn(total_timesteps=100_000)
+>>>>>>> refs/remotes/origin/main
     model.save("ppo_crustle")
