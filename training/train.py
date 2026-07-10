@@ -65,5 +65,9 @@ if __name__ == "__main__":
         tensorboard_log="./ppo_cabt_logs/",
     )
 
+<<<<<<< HEAD
+    model.learn(total_timesteps=1_000_00)
+=======
     model.learn(total_timesteps=100_000)
+>>>>>>> refs/remotes/origin/main
     model.save("ppo_crustle")
