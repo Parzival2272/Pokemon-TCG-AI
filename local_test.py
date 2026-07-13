@@ -1,5 +1,6 @@
 from kaggle_environments import make
-from main import agent
+from crustle_agent import agent as crustle_agent
+from agent import agent as rl_agent
 import json
 from collections import Counter
 import hashlib, time
@@ -14,7 +15,7 @@ deck_hash = hashlib.md5(str(deck).encode()).hexdigest()[:8]
 print(f"Deck hash: {deck_hash}  Timestamp: {time.time()}")
 
 env = make("cabt", configuration={"decks": [deck.copy(), deck.copy()]}, debug=True)
-env.run([agent, agent])
+env.run([rl_agent, crustle_agent])
 
 for i, agent_state in enumerate(env.state):
     print(

@@ -1,5 +1,6 @@
 import os
 from crustle_agent import agent as crustle_agent
+from agent import agent as rl_agent
 
 _KAGGLE_DECK_PATH = "/kaggle_simulations/agent/deck.csv"
 if os.path.exists(_KAGGLE_DECK_PATH):
@@ -18,6 +19,7 @@ _set_deck(_deck)
 
 AGENTS = {
     "crustle": crustle_agent,
+    "ppo_crustle": rl_agent,
     # "other": other_agents,
 }
 
