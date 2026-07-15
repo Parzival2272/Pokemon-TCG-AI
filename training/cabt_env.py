@@ -2,7 +2,12 @@ import warnings
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.policies import ActorCriticPolicy
-from training.obs_vectorizer import MAX_OPTIONS, VECTOR_SIZE, obs_to_vector
+from training.obs_vectorizer import (
+    MAX_OPTIONS,
+    VECTOR_SIZE,
+    obs_to_vector,
+    set_vectorizer_deck,
+)
 import numpy as np
 import gymnasium as gym
 
@@ -87,6 +92,7 @@ class CabtEnv(gym.Env):
         if self._battle is not None:
             battle_finish()
         deck = _load_deck()
+        set_vectorizer_deck(deck)
         obs_dict, start_data = battle_start(deck, deck)
         if start_data.errorPlayer >= 0:
             # Invalid deck -- shouldn't happen if deck is correct
