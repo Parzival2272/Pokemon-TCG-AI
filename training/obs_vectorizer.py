@@ -1,7 +1,9 @@
 import numpy as np
+from collections import Counter
 
 MAX_BENCH = 5
 MAX_HAND = 60
+MAX_DECK_SLOTS = 60
 # Some MAIN-select decisions (PLAY/ATTACH/EVOLVE/ABILITY/DISCARD/RETREAT/
 # ATTACK/END all share one option list) can offer more options than a
 # simple per-card cap would suggest, so this needs real headroom.
@@ -12,9 +14,166 @@ VECTOR_SIZE = (
     CARD_FEATURES * 2  # your + opponent active
     + CARD_FEATURES * MAX_BENCH * 2  # your + opponent bench
     + MAX_HAND  # hand card ids
+    + MAX_DECK_SLOTS  # per-deck-slot prize belief
     + 4  # your_prizes, opp_prizes, stadium_id, context
     + MAX_OPTIONS  # option_types
 )
+
+# Deck order used for prize-belief features (set by CabtEnv.reset).
+_VECTORIZER_DECK = [0] * MAX_DECK_SLOTS
+
+
+def set_vectorizer_deck(deck: list[int]) -> None:
+    """Set deck list used by the prize-belief feature block.
+
+    The 60 output features map 1:1 to this deck list order.
+    """
+    global _VECTORIZER_DECK
+    if len(deck) != MAX_DECK_SLOTS:
+        raise ValueError(
+            f"A deck must contain exactly {MAX_DECK_SLOTS} cards, got {len(deck)}."
+        )
+    _VECTORIZER_DECK = list(deck)
+
+
+def _visible_owned_card_ids(current: dict, your_index: int) -> list[int]:
+    """Collect visible card IDs known to be on your side and not in prizes."""
+    players = current.get("players", [{}, {}])
+    you = players[your_index] if len(players) > your_index else {}
+    card_ids: list[int] = []
+
+    for c in (you.get("hand") or []):
+        cid = c.get("id") if c else None
+        if cid:
+            card_ids.append(cid)
+
+    for c in (you.get("discard") or []):
+        cid = c.get("id") if c else None
+        if cid:
+            card_ids.append(cid)
+
+    for mon in (you.get("active") or []):
+        if not mon:
+            continue
+        mid = mon.get("id")
+        if mid:
+            card_ids.append(mid)
+        for ec in (mon.get("energyCards") or []):
+            cid = ec.get("id") if ec else None
+            if cid:
+                card_ids.append(cid)
+        for tc in (mon.get("tools") or []):
+            cid = tc.get("id") if tc else None
+            if cid:
+                card_ids.append(cid)
+        for pe in (mon.get("preEvolution") or []):
+            cid = pe.get("id") if pe else None
+            if cid:
+                card_ids.append(cid)
+
+    for mon in (you.get("bench") or []):
+        if not mon:
+            continue
+        mid = mon.get("id")
+        if mid:
+            card_ids.append(mid)
+        for ec in (mon.get("energyCards") or []):
+            cid = ec.get("id") if ec else None
+            if cid:
+                card_ids.append(cid)
+        for tc in (mon.get("tools") or []):
+            cid = tc.get("id") if tc else None
+            if cid:
+                card_ids.append(cid)
+        for pe in (mon.get("preEvolution") or []):
+            cid = pe.get("id") if pe else None
+            if cid:
+                card_ids.append(cid)
+
+    for c in (current.get("stadium") or []):
+        if not c or c.get("playerIndex") != your_index:
+            continue
+        cid = c.get("id")
+        if cid:
+            card_ids.append(cid)
+
+    for c in (current.get("looking") or []):
+        if not c or c.get("playerIndex") != your_index:
+            continue
+        cid = c.get("id")
+        if cid:
+            card_ids.append(cid)
+
+    return card_ids
+
+
+def _revealed_deck_card_ids(obs_dict: dict, your_index: int) -> tuple[list[int], bool]:
+    """Collect currently revealed cards known to be in your deck.
+
+    Returns (revealed_ids, full_deck_revealed_now).
+    """
+    current = obs_dict.get("current") or {}
+    players = current.get("players", [{}, {}])
+    you = players[your_index] if len(players) > your_index else {}
+    deck_count = int(you.get("deckCount", 0) or 0)
+
+    select = obs_dict.get("select") or {}
+    revealed: list[int] = []
+    select_deck = select.get("deck") or []
+
+    for c in select_deck:
+        cid = c.get("id") if c else None
+        if cid:
+            revealed.append(cid)
+
+    for o in (select.get("option") or []):
+        if o.get("playerIndex") != your_index:
+            continue
+        if o.get("area") != 1:  # AreaType.DECK
+            continue
+        cid = o.get("cardId")
+        if cid:
+            revealed.append(cid)
+
+    full_reveal = bool(deck_count > 0 and len(select_deck) == deck_count)
+    return revealed, full_reveal
+
+
+def _prize_belief_vec(obs_dict: dict) -> list[float]:
+    """Return 60 normalized probabilities that each deck-slot card is prized."""
+    current = obs_dict.get("current") or {}
+    your_index = int(current.get("yourIndex", 0) or 0)
+    players = current.get("players", [{}, {}])
+    you = players[your_index] if len(players) > your_index else {}
+
+    if not _VECTORIZER_DECK:
+        return [0.0] * MAX_DECK_SLOTS
+
+    remaining_prizes = len(you.get("prize") or [])
+    deck_count = int(you.get("deckCount", 0) or 0)
+
+    visible_non_prize = Counter(_visible_owned_card_ids(current, your_index))
+    revealed_deck, full_reveal = _revealed_deck_card_ids(obs_dict, your_index)
+    visible_non_prize.update(revealed_deck)
+
+    unknown_pool = remaining_prizes + deck_count
+    if full_reveal:
+        unknown_prize_prob = 1.0
+    elif unknown_pool > 0:
+        unknown_prize_prob = remaining_prizes / unknown_pool
+    else:
+        unknown_prize_prob = 0.0
+
+    slot_prob: list[float] = []
+    non_prize_budget = Counter(visible_non_prize)
+    for cid in _VECTORIZER_DECK:
+        if cid and non_prize_budget[cid] > 0:
+            slot_prob.append(0.0)
+            non_prize_budget[cid] -= 1
+        else:
+            slot_prob.append(float(unknown_prize_prob))
+
+    return slot_prob
 
 
 def obs_to_vector(obs_dict: dict) -> np.ndarray:
@@ -49,6 +208,9 @@ def obs_to_vector(obs_dict: dict) -> np.ndarray:
     hand_vec = [c.get("id", 0) / 2000 if c else 0 for c in hand]
     hand_vec += [0] * (MAX_HAND - len(hand_vec))
 
+    # Prize-belief by deck slot (60 features in [0, 1]).
+    prize_belief_vec = _prize_belief_vec(obs_dict)
+
     # Prize counts
     your_prizes = len(you.get("prize") or []) / 6
     opp_prizes = len(opp.get("prize") or []) / 6
@@ -70,6 +232,7 @@ def obs_to_vector(obs_dict: dict) -> np.ndarray:
         + [f for m in your_bench for f in pokemon_vec(m)]  # 20
         + [f for m in opp_bench for f in pokemon_vec(m)]  # 20
         + hand_vec  # MAX_HAND
+        + prize_belief_vec  # MAX_DECK_SLOTS
         + [your_prizes, opp_prizes, stadium_id, context]  # 4
         + option_types  # MAX_OPTIONS
     )
