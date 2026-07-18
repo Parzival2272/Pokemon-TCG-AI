@@ -41,10 +41,22 @@ OPPONENT_POOL = [
     ("crustle", crustle_agent, _load_deck("heuristics/crustle_agent/crustle_deck.csv")),
     ("abomasnow", abomasnow_agent, _load_deck("heuristics/abomasnow_agent/deck.csv")),
     ("dragapult", dragapult_agent, _load_deck("heuristics/dragapult_agent/deck.csv")),
-    ("dragapult_v2", dragapult_v2_agent, _load_deck("heuristics/dragapult_v2_agent/deck.csv")),
+    (
+        "dragapult_v2",
+        dragapult_v2_agent,
+        _load_deck("heuristics/dragapult_v2_agent/deck.csv"),
+    ),
     ("iono", iono_agent, _load_deck("heuristics/iono_agent/deck.csv")),
-    ("archaludon", archaludon_agent, _load_deck("heuristics/archaludon_agent/deck.csv")),
-    ("ragingbolt", ragingbolt_agent, _load_deck("heuristics/ragingbolt_agent/deck.csv")),
+    (
+        "archaludon",
+        archaludon_agent,
+        _load_deck("heuristics/archaludon_agent/deck.csv"),
+    ),
+    (
+        "ragingbolt",
+        ragingbolt_agent,
+        _load_deck("heuristics/ragingbolt_agent/deck.csv"),
+    ),
     ("alakazam", alakazam_agent, _load_deck("heuristics/alakazam_agent/deck.csv")),
     ("starmie", starmie_agent, _load_deck("heuristics/starmie_agent/deck.csv")),
 ]
