@@ -50,9 +50,9 @@ CRUSTLE_SWITCH_IN_ENERGY_THRESHOLD = 3
 # Deck loading
 import os as _os
 
-# __file__ is crustle_agent/crustle_agent.py, so deck.csv (at the project
-# root, alongside the other training scripts) is one directory up.
-_project_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+# __file__ is heuristics/crustle_agent/crustle_agent.py, so deck.csv (at the
+# project root, alongside the other training scripts) is two directories up.
+_project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 _deck_path = _os.path.join(_project_root, "deck.csv")
 with open(_deck_path) as _f:
     deck: list[int] = [int(line) for line in _f.readlines() if line.strip()]

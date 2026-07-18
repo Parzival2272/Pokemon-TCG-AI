@@ -6,7 +6,7 @@ Usage:
 Example:
     python tools/import_kaggle_agent.py ~/Downloads/abomasnow_notebook.py abomasnow
 
-This creates <name>_agent/ at the project root with:
+This creates heuristics/<name>_agent/ with:
     <name>_agent.py  - the script, with `cg.api` imports rewritten to `ptcg.api`
                        and the Kaggle deck-loading block replaced by a
                        package-local loader plus a set_deck() hook
@@ -15,9 +15,10 @@ This creates <name>_agent/ at the project root with:
                        or copied from --deck if given
 
 and registers the new agent in main.py's AGENTS/SET_DECKS dicts. Switch to it
-by setting ACTIVE_AGENT = "<name>" in main.py and copying <name>_agent/deck.csv
-over the project-root deck.csv (main.py pushes the root deck.csv into the
-active agent, matching the Kaggle submission layout).
+by setting ACTIVE_AGENT = "<name>" in main.py and copying
+heuristics/<name>_agent/deck.csv over the project-root deck.csv (main.py
+pushes the root deck.csv into the active agent, matching the Kaggle
+submission layout).
 
 The conversion targets the standard Kaggle starter layout (deck loading that
 starts with `file_path = "deck.csv"`). If a script deviates, the tool warns
@@ -34,6 +35,7 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAIN_PY = PROJECT_ROOT / "main.py"
+HEURISTICS_DIR = PROJECT_ROOT / "heuristics"
 
 LOADER_TEMPLATE = '''# Load deck.csv: package-local first, then the Kaggle agent directory.
 import os as _os
@@ -134,20 +136,20 @@ def parse_decklist(text: str) -> list[int]:
 def register_in_main(name: str, pkg: str) -> bool:
     """Add imports plus AGENTS/SET_DECKS entries to main.py. Idempotent."""
     text = MAIN_PY.read_text()
-    if f"from {pkg} import" in text:
+    if f"from heuristics.{pkg} import" in text:
         print(f"main.py: {pkg} already registered, skipping")
         return True
 
     # Imports go right after the last existing agent-package import.
     last = None
-    for last in re.finditer(r"^from \w+_agent import .*\n", text, re.M):
+    for last in re.finditer(r"^from heuristics\.\w+_agent import .*\n", text, re.M):
         pass
     if last is None:
         return False
     text = (
         text[: last.end()]
-        + f"from {pkg} import agent as {name}_agent\n"
-        + f"from {pkg} import set_deck as {name}_set_deck\n"
+        + f"from heuristics.{pkg} import agent as {name}_agent\n"
+        + f"from heuristics.{pkg} import set_deck as {name}_set_deck\n"
         + text[last.end() :]
     )
 
@@ -182,7 +184,7 @@ def main() -> None:
     if not re.fullmatch(r"[a-z][a-z0-9_]*", args.name):
         sys.exit(f"name must be a lowercase identifier, got {args.name!r}")
     pkg = f"{args.name}_agent"
-    pkg_dir = PROJECT_ROOT / pkg
+    pkg_dir = HEURISTICS_DIR / pkg
     if pkg_dir.exists() and not args.force:
         sys.exit(f"{pkg_dir} already exists (use --force to overwrite)")
 
@@ -198,10 +200,10 @@ def main() -> None:
     if not replaced:
         warnings.append(
             "deck-loading block not recognized: add a package-local loader plus "
-            "set_deck() by hand (see crustle_agent/crustle_agent.py)"
+            "set_deck() by hand (see heuristics/crustle_agent/crustle_agent.py)"
         )
 
-    pkg_dir.mkdir(exist_ok=True)
+    pkg_dir.mkdir(parents=True, exist_ok=True)
     (pkg_dir / f"{pkg}.py").write_text(text, encoding="utf-8")
     (pkg_dir / "__init__.py").write_text(INIT_TEMPLATE.format(module=pkg))
 
@@ -214,7 +216,7 @@ def main() -> None:
         deck_note = f"{len(deck)} cards parsed from decklist comments"
         if len(deck) != 60:
             warnings.append(
-                f"deck.csv has {len(deck)} cards, not 60 -- fix {pkg}/deck.csv "
+                f"deck.csv has {len(deck)} cards, not 60 -- fix heuristics/{pkg}/deck.csv "
                 "by hand (or rerun with --deck path/to/deck.csv)"
             )
 
@@ -228,7 +230,7 @@ def main() -> None:
     print(f'registered "{args.name}" in main.py')
     print(
         f'to play it: set ACTIVE_AGENT = "{args.name}" in main.py and copy '
-        f"{pkg}/deck.csv over deck.csv"
+        f"heuristics/{pkg}/deck.csv over deck.csv"
     )
     for w in warnings:
         print(f"WARNING: {w}", file=sys.stderr)

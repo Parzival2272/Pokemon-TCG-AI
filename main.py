@@ -1,20 +1,24 @@
 import os
 
-from crustle_agent import agent as crustle_agent
+from heuristics.crustle_agent import agent as crustle_agent
 from agent import agent as rl_agent
-from crustle_agent import set_deck as crustle_set_deck
-from abomasnow_agent import agent as abomasnow_agent
-from abomasnow_agent import set_deck as abomasnow_set_deck
-from dragapult_agent import agent as dragapult_agent
-from dragapult_agent import set_deck as dragapult_set_deck
-from iono_agent import agent as iono_agent
-from iono_agent import set_deck as iono_set_deck
-from archaludon_agent import agent as archaludon_agent
-from archaludon_agent import set_deck as archaludon_set_deck
-from dragapult_v2_agent import agent as dragapult_v2_agent
-from dragapult_v2_agent import set_deck as dragapult_v2_set_deck
-from ragingbolt_agent import agent as ragingbolt_agent
-from ragingbolt_agent import set_deck as ragingbolt_set_deck
+from heuristics.crustle_agent import set_deck as crustle_set_deck
+from heuristics.abomasnow_agent import agent as abomasnow_agent
+from heuristics.abomasnow_agent import set_deck as abomasnow_set_deck
+from heuristics.dragapult_agent import agent as dragapult_agent
+from heuristics.dragapult_agent import set_deck as dragapult_set_deck
+from heuristics.iono_agent import agent as iono_agent
+from heuristics.iono_agent import set_deck as iono_set_deck
+from heuristics.archaludon_agent import agent as archaludon_agent
+from heuristics.archaludon_agent import set_deck as archaludon_set_deck
+from heuristics.dragapult_v2_agent import agent as dragapult_v2_agent
+from heuristics.dragapult_v2_agent import set_deck as dragapult_v2_set_deck
+from heuristics.ragingbolt_agent import agent as ragingbolt_agent
+from heuristics.ragingbolt_agent import set_deck as ragingbolt_set_deck
+from heuristics.alakazam_agent import agent as alakazam_agent
+from heuristics.alakazam_agent import set_deck as alakazam_set_deck
+from heuristics.starmie_agent import agent as starmie_agent
+from heuristics.starmie_agent import set_deck as starmie_set_deck
 
 _KAGGLE_DECK_PATH = "/kaggle_simulations/agent/deck.csv"
 if os.path.exists(_KAGGLE_DECK_PATH):
@@ -37,6 +41,8 @@ AGENTS = {
     "archaludon": archaludon_agent,
     "dragapult_v2": dragapult_v2_agent,
     "ragingbolt": ragingbolt_agent,
+    "alakazam": alakazam_agent,
+    "starmie": starmie_agent,
 }
 
 SET_DECKS = {
@@ -47,12 +53,14 @@ SET_DECKS = {
     "archaludon": archaludon_set_deck,
     "dragapult_v2": dragapult_v2_set_deck,
     "ragingbolt": ragingbolt_set_deck,
+    "alakazam": alakazam_set_deck,
+    "starmie": starmie_set_deck,
 }
 
 ACTIVE_AGENT = "crustle"
 
 # deck.csv (next to main.py) is the active agent's deck: when switching
-# ACTIVE_AGENT, copy that agent's <name>_agent/deck.csv over deck.csv.
+# ACTIVE_AGENT, copy that agent's heuristics/<name>_agent/deck.csv over deck.csv.
 SET_DECKS[ACTIVE_AGENT](_deck)
 
 

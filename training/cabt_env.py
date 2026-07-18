@@ -8,6 +8,7 @@ from training.obs_vectorizer import (
     obs_to_vector,
     set_vectorizer_deck,
 )
+from training.rewards import compute_reward
 import numpy as np
 import gymnasium as gym
 
@@ -25,20 +26,53 @@ def _load_deck():
     return deck
 
 
+def _sanitize_selection(picks, n_options, min_count, max_count):
+    """Coerce a raw selection into one the native engine will accept.
+
+    Keeps only unique, in-range indices, then clamps the count into
+    [min_count, max_count] -- truncating extras and padding with the
+    lowest-index unpicked options when short. Used for both the learner
+    (whose action is already in range) and heuristic opponents, which can
+    occasionally return a malformed selection (e.g. too few discards) that
+    kaggle_environments would sanitize but raw battle_select rejects.
+    """
+    seen = set()
+    valid = []
+    for i in picks or []:
+        if isinstance(i, int) and 0 <= i < n_options and i not in seen:
+            seen.add(i)
+            valid.append(i)
+    if len(valid) > max_count:
+        valid = valid[:max_count]
+    if len(valid) < min_count:
+        for i in range(n_options):
+            if len(valid) >= min_count:
+                break
+            if i not in seen:
+                seen.add(i)
+                valid.append(i)
+        valid.sort()
+    return valid
+
+
 class CabtEnv(gym.Env):
     """Wraps a CABT game as a Gymnasium environment."""
 
     OBS_SIZE = VECTOR_SIZE
     MAX_OPTIONS = MAX_OPTIONS
 
-    def __init__(self, opponent_agent=None):
+    def __init__(self, opponent_agents=None):
         """
         Args:
-            opponent_agent: Optional callable(obs_dict) -> list[int], e.g.
-                `crustle_agent.agent`. When set, the learner plays only one
-                side (randomized each episode) and this callable makes every
-                decision for the other side. When None (default), both
-                sides are controlled by the RL policy (pure self-play).
+            opponent_agents: Optional pool of heuristic opponents. Either None
+                (pure self-play -- both sides are the RL policy, both playing
+                the DECK_PATH deck) or a list of (name, agent_fn, deck) tuples.
+                When a pool is given, one opponent is chosen uniformly at
+                random each episode; it controls one side (the learner's side
+                is randomized) and pilots its own `deck`, while the learner
+                always plays the DECK_PATH deck. `agent_fn` is a
+                callable(obs_dict) -> list[int]; `name` labels the matchup for
+                logging; `deck` is a 60-card ID list.
         """
         super().__init__()
         self.observation_space = gym.spaces.Box(
@@ -49,7 +83,10 @@ class CabtEnv(gym.Env):
         # once (see SelectData.minCount/maxCount), not just exactly 1.
         self.action_space = gym.spaces.MultiBinary(self.MAX_OPTIONS)
 
-        self._opponent_agent = opponent_agent
+        self._opponent_agents = opponent_agents
+        # Per-episode opponent, chosen in reset() (None while in self-play).
+        self._opponent_agent = None
+        self._opponent_name = "selfplay"
         self._learner_index = 0
         self._obs = None
         self._n_options = 0
@@ -68,7 +105,22 @@ class CabtEnv(gym.Env):
                 return obs_dict
             if current.get("yourIndex", 0) == self._learner_index:
                 return obs_dict
-            obs_dict = battle_select(self._opponent_agent(obs_dict))
+            select = obs_dict.get("select") or {}
+            n = len(select.get("option") or [])
+            min_count = min(select.get("minCount", 1), n)
+            max_count = min(select.get("maxCount", 1), n)
+            # Some heuristics can raise on certain board states (e.g. an
+            # out-of-range index in their discard logic). kaggle_environments
+            # swallows such agent errors; do the same here so one opponent's
+            # bug can't kill a long training run -- fall back to a safe
+            # lowest-index selection (sanitize pads it to minCount).
+            try:
+                raw = self._opponent_agent(obs_dict)
+            except Exception:
+                raw = []
+            obs_dict = battle_select(
+                _sanitize_selection(raw, n, min_count, max_count)
+            )
 
     def _sync_select_state(self, obs_dict):
         select = obs_dict.get("select") or {}
@@ -91,16 +143,34 @@ class CabtEnv(gym.Env):
         super().reset(seed=seed)
         if self._battle is not None:
             battle_finish()
-        deck = _load_deck()
-        set_vectorizer_deck(deck)
-        obs_dict, start_data = battle_start(deck, deck)
-        if start_data.errorPlayer >= 0:
-            # Invalid deck -- shouldn't happen if deck is correct
-            raise RuntimeError("Battle start failed")
-        if self._opponent_agent is not None:
+        learner_deck = _load_deck()
+        # Prize-belief features are always from the learner's perspective, so
+        # the vectorizer deck is the learner's deck regardless of opponent.
+        set_vectorizer_deck(learner_deck)
+
+        if self._opponent_agents:
+            # Pick a fresh opponent for this episode; it pilots its own deck.
+            self._opponent_name, self._opponent_agent, opp_deck = (
+                self._opponent_agents[
+                    int(self.np_random.integers(0, len(self._opponent_agents)))
+                ]
+            )
             # Randomize which side the learner plays so it doesn't overfit
             # to always going first (or second).
             self._learner_index = int(self.np_random.integers(0, 2))
+            if self._learner_index == 0:
+                obs_dict, start_data = battle_start(learner_deck, opp_deck)
+            else:
+                obs_dict, start_data = battle_start(opp_deck, learner_deck)
+        else:
+            # Pure self-play: both sides are the RL policy on the same deck.
+            self._opponent_name, self._opponent_agent = "selfplay", None
+            obs_dict, start_data = battle_start(learner_deck, learner_deck)
+
+        if start_data.errorPlayer >= 0:
+            # Invalid deck -- shouldn't happen if decks are correct
+            raise RuntimeError("Battle start failed")
+        if self._opponent_agent is not None:
             obs_dict = self._play_opponent_until_learner_turn(obs_dict)
         self._obs = obs_dict
         self._sync_select_state(obs_dict)
@@ -109,25 +179,19 @@ class CabtEnv(gym.Env):
     def step(self, action):
         from ptcg.game import battle_select
 
-        # `action` is a MAX_OPTIONS-length 0/1 vector. Only the first
-        # n_options slots are meaningful; the rest are masked out.
-        selected = [i for i in range(self._n_options) if action[i]]
+        # Learner's observation before this action -- the "before" state for
+        # prize-differential shaping (in heuristic mode it's always the
+        # learner's perspective, captured before self._obs is overwritten).
+        prev_obs = self._obs
 
-        # The native engine requires exactly minCount <= len(selected) <=
-        # maxCount. The mask can't enforce this jointly (each slot is an
-        # independent Bernoulli), so clamp here: truncate excess picks, and
-        # pad with the lowest-index unpicked options if we're short.
-        if len(selected) > self._max_count:
-            selected = selected[: self._max_count]
-        if len(selected) < self._min_count:
-            chosen = set(selected)
-            for i in range(self._n_options):
-                if len(selected) >= self._min_count:
-                    break
-                if i not in chosen:
-                    selected.append(i)
-                    chosen.add(i)
-            selected.sort()
+        # `action` is a MAX_OPTIONS-length 0/1 vector. Only the first
+        # n_options slots are meaningful; the rest are masked out. The native
+        # engine requires exactly minCount <= len(selected) <= maxCount, which
+        # the per-slot Bernoulli mask can't enforce jointly, so clamp here.
+        selected = [i for i in range(self._n_options) if action[i]]
+        selected = _sanitize_selection(
+            selected, self._n_options, self._min_count, self._max_count
+        )
 
         obs_dict = battle_select(selected)
         if self._opponent_agent is not None:
@@ -141,17 +205,27 @@ class CabtEnv(gym.Env):
         result = current.get("result", -1)
 
         done = result >= 0
-        reward = 0.0
-        if done:
-            if self._opponent_agent is not None:
-                reward = 1.0 if result == self._learner_index else -1.0
-            else:
-                your_index = current.get("yourIndex", 0)
-                # result=0 means player 0 wins, result=1 means player 1 wins
-                reward = 1.0 if result != your_index else -1.0
+        # The reward for this step belongs to the player who just acted. The
+        # rollout pairs it with prev_obs (the state the action was chosen
+        # from), so "me" is that player, and compute_reward reads prizes /
+        # decides win-loss from their (absolute) index.
+        if self._opponent_agent is not None:
+            me_index = self._learner_index  # learner is a fixed side
+        else:
+            # Self-play: the actor is whoever was to move in prev_obs. (Using
+            # the *terminal* obs's yourIndex here is wrong -- control doesn't
+            # flip at game end, so result == that index and the winning move
+            # would score -1.)
+            me_index = (prev_obs.get("current") or {}).get("yourIndex", 0)
+        reward = compute_reward(prev_obs, obs_dict, done, result, me_index)
+
+        # Tag the finished game with the opponent so WinRateCallback can
+        # bucket win rate per matchup (Monitor lifts this into info["episode"]
+        # via info_keywords=("opponent",)).
+        info = {"opponent": self._opponent_name} if done else {}
 
         self._sync_select_state(obs_dict)
-        return obs_to_vector(obs_dict), reward, done, False, {}
+        return obs_to_vector(obs_dict), reward, done, False, info
 
     def action_masks(self) -> np.ndarray:
         """Return a (MAX_OPTIONS, 2) mask for sb3-contrib's MaskablePPO.

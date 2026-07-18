@@ -1,5 +1,5 @@
 from kaggle_environments import make
-from crustle_agent import agent as crustle_agent
+from heuristics.crustle_agent import agent as crustle_agent
 from agent import agent as rl_agent
 import json
 from collections import Counter

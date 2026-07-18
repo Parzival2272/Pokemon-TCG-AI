@@ -60,7 +60,6 @@ CARD_NAME = {
 def card_name_from_game_id(card_id):
     return CARD_NAME.get(int(card_id), f"UNKNOWN_{card_id}")
 
-def read_deck_csv() -> list[int]:
 # Load deck.csv: package-local first, then the Kaggle agent directory.
 import os as _os
 
@@ -711,7 +710,7 @@ def agent(obs_dict: dict) -> list[int]:
     obs: Observation = to_observation_class(obs_dict)
 
     if obs.select is None:
-        return read_deck_csv()
+        return my_deck
 
     options = obs.select.option
 

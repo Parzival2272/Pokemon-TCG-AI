@@ -129,11 +129,20 @@ def _update_opp_attack_tracking(obs):
 # ── Board helpers ──
 
 def read_deck_csv():
-    fp = "deck.csv"
+    fp = os.path.join(os.path.dirname(os.path.abspath(ROOT)), "deck.csv") if ROOT else "deck.csv"
     if not os.path.exists(fp):
         fp = "/kaggle_simulations/agent/deck.csv"
     with open(fp) as f:
         return [int(line) for line in f.read().strip().split("\n")]
+
+
+my_deck: list[int] = read_deck_csv()
+
+
+def set_deck(deck_list: list[int]) -> None:
+    """Override the deck loaded from deck.csv. Called by main.py."""
+    global my_deck
+    my_deck = list(deck_list)
 
 
 def get_card(obs, area, index, player_index):
@@ -1086,7 +1095,7 @@ def agent(obs_dict):
         global _opp_last_attack_id, _cur_turn_logs
         _opp_last_attack_id = None
         _cur_turn_logs.clear()
-        return read_deck_csv()
+        return my_deck
     _update_opp_attack_tracking(obs)
     if not obs.select.option:
         return []

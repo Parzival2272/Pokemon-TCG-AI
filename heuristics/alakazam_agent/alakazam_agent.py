@@ -1,50 +1,54 @@
 import os
 import sys
 from collections import defaultdict
-from cg.api import (
-    AreaType, CardType, EnergyType, Observation, 
-    SelectContext, OptionType, Card, Pokemon, 
+from ptcg.api import (
+    AreaType, CardType, EnergyType, Observation,
+    SelectContext, OptionType, Card, Pokemon,
     all_card_data, to_observation_class
 )
 
-file_path = "deck.csv"
-if not os.path.exists(file_path):
-    file_path = "/kaggle_simulations/agent/" + file_path
-with open(file_path, "r") as file:
-    csv = file.read().split("\n")
-    my_deck = []
-    for i in range(60):
-        my_deck.append(int(csv[i]))
+# Load deck.csv: package-local first, then the Kaggle agent directory.
+_deck_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deck.csv")
+if not os.path.exists(_deck_path):
+    _deck_path = "/kaggle_simulations/agent/deck.csv"
+with open(_deck_path) as _f:
+    my_deck: list[int] = [int(_line) for _line in _f.read().splitlines() if _line.strip()]
+
+
+def set_deck(deck_list: list[int]) -> None:
+    """Override the deck loaded from deck.csv. Called by main.py."""
+    global my_deck
+    my_deck = list(deck_list)
 
 all_card = all_card_data()
 card_table = {c.cardId: c for c in all_card}
 
 # --- Your Decklist IDs ---
-Abra = 741 
-Kadabra = 742 
-Alakazam = 743 
-Dunsparce = 305 
-Dudunsparce = 66 
-Fezandipiti_ex = 140 
-Genesect = 142 
-Shaymin = 343 
+Abra = 741
+Kadabra = 742
+Alakazam = 743
+Dunsparce = 305
+Dudunsparce = 66
+Fezandipiti_ex = 140
+Genesect = 142
+Shaymin = 343
 
-Rare_Candy = 1079 
-Enhanced_Hammer = 1081 
-Buddy_Buddy_Poffin = 1086 
-Night_Stretcher = 1097 
-Sacred_Ash = 1129 
-Poke_Pad = 1152 
-Lucky_Helmet = 1156 
-Boss_Orders = 1182 
-Brocks_Scouting = 1210 
-Hilda = 1225 
-Dawn = 1231 
-Lanas_Aid = 1184 
+Rare_Candy = 1079
+Enhanced_Hammer = 1081
+Buddy_Buddy_Poffin = 1086
+Night_Stretcher = 1097
+Sacred_Ash = 1129
+Poke_Pad = 1152
+Lucky_Helmet = 1156
+Boss_Orders = 1182
+Brocks_Scouting = 1210
+Hilda = 1225
+Dawn = 1231
+Lanas_Aid = 1184
 
-Basic_Psychic_Energy = 5 
-Telepath_Psychic_Energy = 19 
-Enriching_Energy = 13 
+Basic_Psychic_Energy = 5
+Telepath_Psychic_Energy = 19
+Enriching_Energy = 13
 
 # Opponent card IDs to watch for
 Duskull = 131
@@ -56,9 +60,9 @@ Mist_Energy = 11
 Rock_Fighting_Energy = 20
 
 # Attack IDs
-ATTACK_TELEPORTATION = 1070 
-ATTACK_SUPER_PSY_BOLT = 1071 
-ATTACK_POWERFUL_HAND = 1072 
+ATTACK_TELEPORTATION = 1070
+ATTACK_SUPER_PSY_BOLT = 1071
+ATTACK_POWERFUL_HAND = 1072
 
 # Sets for easy filtering
 ABRA_LINE = {Abra, Kadabra, Alakazam}
@@ -114,8 +118,8 @@ def agent(obs_dict: dict) -> list[int]:
     # Count cards across zones
     field_counts = defaultdict(int)
     hand_counts = defaultdict(int)
-    my_field = [] 
-    
+    my_field = []
+
     for card in my_state.active:
         if card is not None:
             field_counts[card.id] += 1
@@ -124,7 +128,7 @@ def agent(obs_dict: dict) -> list[int]:
         if card is not None:
             field_counts[card.id] += 1
             my_field.append((idx + 1, card))
-            
+
     for card in my_state.hand:
         hand_counts[card.id] += 1
 
@@ -138,12 +142,12 @@ def agent(obs_dict: dict) -> list[int]:
 
     op_has_duskull = any(p.id == Duskull for p in op_all_pokemon)
     op_has_water_threat = any(
-        p.id in Slowpoke_IDs or p.id in Froakie_IDs or p.id == Wellspring_Mask_Ogerpon_ex or p.id == N_Darumaka 
+        p.id in Slowpoke_IDs or p.id in Froakie_IDs or p.id == Wellspring_Mask_Ogerpon_ex or p.id == N_Darumaka
         for p in op_all_pokemon
     )
-    
+
     op_used_ace_spec = any(
-        card_table.get(log.cardId).aceSpec for log in obs.logs 
+        card_table.get(log.cardId).aceSpec for log in obs.logs
         if hasattr(log, 'cardId') and log.cardId is not None and card_table.get(log.cardId)
         and hasattr(log, 'playerIndex') and log.playerIndex == (1 - my_index)
     )
@@ -158,14 +162,14 @@ def agent(obs_dict: dict) -> list[int]:
     use_kadabra_finish = (op_active_hp <= 30)
     current_hand_size = len(my_state.hand)
     current_damage = current_hand_size * 20
-    
-    max_potential_hand = current_hand_size 
+
+    max_potential_hand = current_hand_size
     if not ability_used_dudunsparce and field_counts[Dudunsparce] > 0: max_potential_hand += 3
     if not ability_used_fezandipiti and field_counts[Fezandipiti_ex] > 0: max_potential_hand += 3
     if not state.supporterPlayed:
         if hand_counts[Dawn] > 0: max_potential_hand += 2
         elif hand_counts[Hilda] > 0: max_potential_hand += 1
-            
+
     max_potential_damage = max_potential_hand * 20
 
     target_use_boss = False
@@ -195,14 +199,14 @@ def agent(obs_dict: dict) -> list[int]:
                 if p_prize > best_bench_prize:
                     best_bench_prize = p_prize
                     best_bench_idx = idx + 1
-        
+
         if best_bench_prize > 0 and hand_counts[Boss_Orders] > 0:
             target_use_boss = True
             target_can_kill = True
             target_idx = best_bench_idx
             target_pokemon = op_state.bench[best_bench_idx - 1]
             target_prize_gain = best_bench_prize
-            if target_pokemon.hp > (current_hand_size - 1) * 20: 
+            if target_pokemon.hp > (current_hand_size - 1) * 20:
                 need_dudunsparce_draw = True
                 need_fezandipiti_draw = True
         elif best_bench_prize > 0 and hand_counts[Boss_Orders] == 0:
@@ -218,12 +222,12 @@ def agent(obs_dict: dict) -> list[int]:
         elif o.type == OptionType.YES: score = 1
         elif o.type == OptionType.CARD:
             card = get_card(obs, o.area, o.index, o.playerIndex)
-            if card is None: 
+            if card is None:
                 scores.append(score)
                 continue
-                
+
             energy_count = len(card.energies) if isinstance(card, Pokemon) else 0
-            
+
             if context == SelectContext.SWITCH or context == SelectContext.TO_ACTIVE:
                 if o.playerIndex == my_index:
                     if card.id == Alakazam: score += 100 + energy_count * 10
@@ -234,18 +238,18 @@ def agent(obs_dict: dict) -> list[int]:
                 else:
                     if target_use_boss and target_pokemon is not None:
                         if o.index == target_idx - 1: score += 100
-                        
+
             elif context == SelectContext.SETUP_ACTIVE_POKEMON:
                 if card.id == Abra: score = 10
                 elif card.id == Dunsparce: score = 5
                 elif card.id == Shaymin: score = 1
-                
+
             elif context == SelectContext.SETUP_BENCH_POKEMON:
                 if card.id == Abra:
                     score = 200 if abra_line_on_field == 0 else 100 + (3 - abra_line_on_field) * 10
                 elif card.id == Dunsparce:
                     score = 150 if dunsparce_line_on_field == 0 else 50
-                    
+
             elif context == SelectContext.TO_HAND:
                 score = 200 - hand_counts.get(card.id, 0) * 50
                 if card.id == Dudunsparce: score += 80 if (field_counts[Dunsparce] >= 1 and field_counts[Dudunsparce] == 0) else -50
@@ -254,7 +258,7 @@ def agent(obs_dict: dict) -> list[int]:
                 elif card.id == Abra: score += 50 if abra_line_on_field < 3 else -50
                 elif card.id in PSYCHIC_ENERGY_IDS: score += 30 if not state.energyAttached else -10
                 elif card.id == Rare_Candy: score += 40 if field_counts[Abra] >= 1 else -10
-                
+
             elif context == SelectContext.ATTACH_FROM:
                 if isinstance(card, Pokemon):
                     if len(card.energyCards) >= 1: score = -1
@@ -272,46 +276,46 @@ def agent(obs_dict: dict) -> list[int]:
         elif o.type == OptionType.PLAY:
             card = get_card(obs, AreaType.HAND, o.index, my_index)
             is_early = state.turn <= 2
-            
+
             if card.id == Buddy_Buddy_Poffin:
                 if abra_line_on_field < 3 or dunsparce_line_on_field < 2: score = 20000
                 else: score = -1
-                
+
             elif card.id == Abra:
                 if is_early: score += 500
                 elif abra_line_on_field < 3: score += 200
                 elif bench_free <= 1: score = -1
                 else: score += 50
-                
+
             elif card.id == Dunsparce:
                 if dunsparce_line_on_field < 1: score += 400 if is_early else 100
                 elif dunsparce_line_on_field < 2: score += 50
                 else: score = -1
-                
+
             elif card.id == Fezandipiti_ex:
                 if need_fezandipiti_draw or need_fezandipiti_for_setup:
                     score += 80 if not is_early else 30
-                else: score = -1 
-                
+                else: score = -1
+
             elif card.id == Genesect:
                 if not op_used_ace_spec and (hand_counts[Lucky_Helmet] > 0 or hand_counts[Poke_Pad] > 0): score += 100
                 else: score = -1
-                
+
             elif card.id == Shaymin:
                 score += 300 if op_has_water_threat else -1
-                
-            elif card.id == Lucky_Helmet: score = 7000 
-            
+
+            elif card.id == Lucky_Helmet: score = 7000
+
             elif card.id in RECOVERY_CARDS:
                 if abra_line_on_field < 3: score = 10000
                 else: score = -1
-                
+
             elif card.id == Boss_Orders:
                 score = 3200 if target_use_boss and target_can_kill else -1
-                
+
             elif card.id == Hilda:
                 score = 3000 if safe_draws >= 2 else -1
-                
+
             elif card.id == Dawn:
                 score = 3100 if safe_draws >= 3 else -1
 
@@ -321,14 +325,14 @@ def agent(obs_dict: dict) -> list[int]:
         elif o.type == OptionType.ATTACH:
             card = get_card(obs, AreaType.HAND, o.index, my_index)
             pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
-            
+
             if card.id == Lucky_Helmet:
                 score = 7000
                 if pokemon.id == Genesect and not op_used_ace_spec: score += 300
                 elif o.inPlayArea == AreaType.ACTIVE: score += 200
-                
+
             elif card.id in PSYCHIC_ENERGY_IDS:
-                if len(pokemon.energyCards) >= 1: score = -1 
+                if len(pokemon.energyCards) >= 1: score = -1
                 elif pokemon.id in ABRA_LINE:
                     score = 8000
                     if pokemon.id == Alakazam: score += 30
@@ -336,9 +340,9 @@ def agent(obs_dict: dict) -> list[int]:
                     elif pokemon.id == Abra: score += 10
                     if o.inPlayArea == AreaType.ACTIVE: score += 5
                 else: score = -1
-                
+
             elif card.id == Enriching_Energy:
-                if len(pokemon.energyCards) >= 1: score = -1 
+                if len(pokemon.energyCards) >= 1: score = -1
                 elif pokemon.id in DUNSPARCE_LINE:
                     score = 8500
                     if pokemon.id == Dudunsparce: score += 10
@@ -349,14 +353,14 @@ def agent(obs_dict: dict) -> list[int]:
             pokemon = get_card(obs, o.inPlayArea, o.inPlayIndex, my_index)
             score = 9000
             if card.id == Alakazam:
-                if safe_draws < 3: score = -1 
-                elif o.inPlayArea == AreaType.ACTIVE: score += 200 
-                else: score += 50 
+                if safe_draws < 3: score = -1
+                elif o.inPlayArea == AreaType.ACTIVE: score += 200
+                else: score += 50
             elif card.id == Kadabra:
                 if safe_draws < 2: score = -1
                 else:
                     score += 100 if len(pokemon.energies) == 0 else -20
-                    if hand_counts[Rare_Candy] > 0 and hand_counts[Alakazam] > 0: score -= 100 
+                    if hand_counts[Rare_Candy] > 0 and hand_counts[Alakazam] > 0: score -= 100
             elif card.id == Dudunsparce:
                 score += 80 if safe_draws >= 2 else -1
 
@@ -372,7 +376,7 @@ def agent(obs_dict: dict) -> list[int]:
 
         elif o.type == OptionType.RETREAT:
             if active_id == Alakazam and active_has_psychic: score = -1
-            elif use_kadabra_finish and active_id != Kadabra and field_counts[Kadabra] >= 1: score = 2500 
+            elif use_kadabra_finish and active_id != Kadabra and field_counts[Kadabra] >= 1: score = 2500
             elif active_id in (Abra, Dunsparce, Dudunsparce, Shaymin, Genesect):
                 score = 2000 if field_counts[Alakazam] >= 1 or field_counts[Kadabra] >= 1 else -1
             else: score = -1
@@ -387,7 +391,7 @@ def agent(obs_dict: dict) -> list[int]:
         scores.append(score)
 
     desc_indices = [i for i, _ in sorted(enumerate(scores), key=lambda x: x[1], reverse=True)]
-    
+
     if context == SelectContext.MAIN and len(desc_indices) > 0:
         o = select.option[desc_indices[0]]
         if o.type == OptionType.ABILITY:

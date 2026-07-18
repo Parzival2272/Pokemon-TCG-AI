@@ -2,5 +2,5 @@
 __pycache__/
 *.pyc
 .DS_Store
-lucario/vis.json
-lucario/*.html
+heuristics/lucario/vis.json
+heuristics/lucario/*.html
