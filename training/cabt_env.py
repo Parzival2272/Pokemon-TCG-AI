@@ -92,7 +92,6 @@ class CabtEnv(gym.Env):
         self._n_options = 0
         self._min_count = 0
         self._max_count = 0
-        self._battle = None
 
     def _play_opponent_until_learner_turn(self, obs_dict):
         """Auto-play the non-learner side with `opponent_agent` until it's
@@ -139,10 +138,16 @@ class CabtEnv(gym.Env):
     def reset(self, seed=None, options=None):
         # Start a new CABT game (self-play by default; vs opponent_agent if set)
         from ptcg.game import battle_start, battle_finish
+        from ptcg.sim import Battle
 
         super().reset(seed=seed)
-        if self._battle is not None:
+        # Free the previous episode's native battle before starting a new one,
+        # or it leaks inside cg.dll. Battle.battle_ptr is the engine's own
+        # record of the live battle (one per process, see train.py), so it --
+        # not env-local state -- is the thing to check.
+        if Battle.battle_ptr:
             battle_finish()
+            Battle.battle_ptr = None
         learner_deck = _load_deck()
         # Prize-belief features are always from the learner's perspective, so
         # the vectorizer deck is the learner's deck regardless of opponent.
@@ -226,6 +231,15 @@ class CabtEnv(gym.Env):
 
         self._sync_select_state(obs_dict)
         return obs_to_vector(obs_dict), reward, done, False, info
+
+    def close(self):
+        from ptcg.game import battle_finish
+        from ptcg.sim import Battle
+
+        if Battle.battle_ptr:
+            battle_finish()
+            Battle.battle_ptr = None
+        super().close()
 
     def action_masks(self) -> np.ndarray:
         """Return a (MAX_OPTIONS, 2) mask for sb3-contrib's MaskablePPO.

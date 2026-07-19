@@ -116,4 +116,4 @@ if __name__ == "__main__":
     )
 
     model.learn(total_timesteps=7_000_000, callback=WinRateCallback())
-    model.save("ppo_starmie")
+    model.save("ppo_starmie_v2")
