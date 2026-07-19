@@ -14,15 +14,8 @@ from heuristics.dragapult_agent import agent as dragapult_agent
 from heuristics.dragapult_v2_agent import agent as dragapult_v2_agent
 from heuristics.iono_agent import agent as iono_agent
 from heuristics.archaludon_agent import agent as archaludon_agent
-from heuristics.ragingbolt_agent import agent as ragingbolt_agent
 from heuristics.alakazam_agent import agent as alakazam_agent
 from heuristics.starmie_agent import agent as starmie_agent
-
-# ragingbolt_agent ships with a per-step hand/option dump behind DEBUG; silence
-# it so a training run with hundreds of thousands of steps isn't flooded.
-import heuristics.ragingbolt_agent.ragingbolt_agent as _ragingbolt_module
-
-_ragingbolt_module.DEBUG = False
 
 
 def _load_deck(path):
@@ -52,11 +45,9 @@ OPPONENT_POOL = [
         archaludon_agent,
         _load_deck("heuristics/archaludon_agent/deck.csv"),
     ),
-    (
-        "ragingbolt",
-        ragingbolt_agent,
-        _load_deck("heuristics/ragingbolt_agent/deck.csv"),
-    ),
+    # ragingbolt is excluded for now: its discard logic is buggy (returns 2
+    # picks on "discard exactly 3", IndexError on some board states), so it
+    # plays artificially weak and inflates win rates. Re-add once fixed.
     ("alakazam", alakazam_agent, _load_deck("heuristics/alakazam_agent/deck.csv")),
     ("starmie", starmie_agent, _load_deck("heuristics/starmie_agent/deck.csv")),
 ]
@@ -117,8 +108,6 @@ if __name__ == "__main__":
         n_steps=N_STEPS,  # N_STEPS * N_ENVS ~= TARGET_SAMPLES_PER_UPDATE
         batch_size=64,
         n_epochs=10,
-        # Self-play games run ~157 decisions; 0.99^157 ~= 0.2 dilutes the
-        # terminal reward too much, 0.995^157 ~= 0.46 keeps it visible.
         gamma=0.995,
         # SB3's default is 0.0; a small entropy bonus keeps the policy
         # exploring instead of collapsing onto one action pattern early.
@@ -126,5 +115,5 @@ if __name__ == "__main__":
         tensorboard_log="./ppo_cabt_logs/",
     )
 
-    model.learn(total_timesteps=1_000_000, callback=WinRateCallback())
+    model.learn(total_timesteps=7_000_000, callback=WinRateCallback())
     model.save("ppo_starmie")

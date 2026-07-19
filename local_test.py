@@ -1,5 +1,4 @@
 from kaggle_environments import make
-from heuristics.crustle_agent import agent as crustle_agent
 from agent import agent as rl_agent
 import json
 from collections import Counter
@@ -15,7 +14,8 @@ deck_hash = hashlib.md5(str(deck).encode()).hexdigest()[:8]
 print(f"Deck hash: {deck_hash}  Timestamp: {time.time()}")
 
 env = make("cabt", configuration={"decks": [deck.copy(), deck.copy()]}, debug=True)
-env.run([rl_agent, crustle_agent])
+# Starmie PPO vs itself (both seats run the same model; deck.csv = starmie deck).
+env.run([rl_agent, rl_agent])
 
 for i, agent_state in enumerate(env.state):
     print(

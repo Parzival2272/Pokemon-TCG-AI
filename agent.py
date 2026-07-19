@@ -1,8 +1,8 @@
-"""Inference wrapper that exposes the trained ppo_crustle.zip model as an
-`agent(obs_dict) -> list[int]` callable, matching crustle_agent's interface
+"""Inference wrapper that exposes the trained ppo.zip model as an
+`agent(obs_dict) -> list[int]` callable, matching the other heuristic agent's interface
 so it can be dropped into main.py's AGENTS dict.
 
-ppo_crustle.zip is a MaskablePPO model (see training/train.py) trained on
+ppo_starmie.zip is a MaskablePPO model (see training/train.py) trained on
 vectorized observations (training/obs_vectorizer.obs_to_vector) with a
 MultiBinary(MAX_OPTIONS) action space. This module does the same
 obs_dict -> vector conversion and action-mask construction that
@@ -16,22 +16,43 @@ import os
 import numpy as np
 from sb3_contrib import MaskablePPO
 
-from training.obs_vectorizer import MAX_OPTIONS, obs_to_vector
+from training.obs_vectorizer import (
+    MAX_OPTIONS,
+    VECTOR_SIZE,
+    obs_to_vector,
+    set_vectorizer_deck,
+)
 
 _project_root = os.path.dirname(os.path.abspath(__file__))
-_model_path = os.path.join(_project_root, "ppo_crustle.zip")
+_model_path = os.path.join(_project_root, "ppo_starmie.zip")
 _deck_path = os.path.join(_project_root, "deck.csv")
 
 with open(_deck_path) as _f:
     deck: list[int] = [int(line) for line in _f.readlines() if line.strip()]
 
+# The prize-belief block of the observation is computed against this deck
+# list; training sets it every episode (CabtEnv.reset), so inference must
+# set it too or those 60 features silently degrade to base-rate values.
+set_vectorizer_deck(deck)
+
 _model = MaskablePPO.load(_model_path)
+
+# Fail loudly if the model was trained on a different observation layout
+# (e.g. obs_vectorizer changed since the zip was trained).
+_model_obs = _model.observation_space.shape
+if _model_obs != (VECTOR_SIZE,):
+    raise RuntimeError(
+        f"{os.path.basename(_model_path)} expects observation shape "
+        f"{_model_obs}, but obs_vectorizer produces ({VECTOR_SIZE},). "
+        "Retrain the model or check out the matching obs_vectorizer."
+    )
 
 
 def set_deck(deck_list: list[int]) -> None:
     """Override the deck loaded from deck.csv. Called by main.py if used."""
     global deck
     deck = deck_list
+    set_vectorizer_deck(deck)
 
 
 def agent(obs_dict: dict) -> list[int]:
