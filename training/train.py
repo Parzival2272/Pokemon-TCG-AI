@@ -127,4 +127,4 @@ if __name__ == "__main__":
     )
 
     model.learn(total_timesteps=1_000_000, callback=WinRateCallback())
-    model.save("ppo_crustle")
+    model.save("ppo_starmie")
