@@ -328,7 +328,8 @@ def choose_discard_low_value(obs):
         values.append((v, option_i, op.index, name))
 
     values.sort()
-    print("DISCARD_CANDIDATES", values)
+    if DEBUG:
+        print("DISCARD_CANDIDATES", values)
 
     return [values[0][1], values[1][1]]
 

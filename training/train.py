@@ -117,9 +117,14 @@ if __name__ == "__main__":
         n_steps=N_STEPS,  # N_STEPS * N_ENVS ~= TARGET_SAMPLES_PER_UPDATE
         batch_size=64,
         n_epochs=10,
-        gamma=0.99,
+        # Self-play games run ~157 decisions; 0.99^157 ~= 0.2 dilutes the
+        # terminal reward too much, 0.995^157 ~= 0.46 keeps it visible.
+        gamma=0.995,
+        # SB3's default is 0.0; a small entropy bonus keeps the policy
+        # exploring instead of collapsing onto one action pattern early.
+        ent_coef=0.01,
         tensorboard_log="./ppo_cabt_logs/",
     )
 
-    model.learn(total_timesteps=100_000, callback=WinRateCallback())
+    model.learn(total_timesteps=1_000_000, callback=WinRateCallback())
     model.save("ppo_crustle")
