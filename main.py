@@ -2,6 +2,7 @@ import os
 
 from heuristics.crustle_agent import agent as crustle_agent
 from agent import agent as rl_agent
+from agent import set_deck as rl_set_deck
 from heuristics.crustle_agent import set_deck as crustle_set_deck
 from heuristics.abomasnow_agent import agent as abomasnow_agent
 from heuristics.abomasnow_agent import set_deck as abomasnow_set_deck
@@ -33,7 +34,7 @@ with open(_deck_path) as _f:
 
 AGENTS = {
     "crustle": crustle_agent,
-    "ppo_crustle": rl_agent,
+    "ppo_starmie": rl_agent,
     # "other": other_agents,
     "abomasnow": abomasnow_agent,
     "dragapult": dragapult_agent,
@@ -47,6 +48,7 @@ AGENTS = {
 
 SET_DECKS = {
     "crustle": crustle_set_deck,
+    "ppo_starmie": rl_set_deck,
     "abomasnow": abomasnow_set_deck,
     "dragapult": dragapult_set_deck,
     "iono": iono_set_deck,
@@ -57,7 +59,7 @@ SET_DECKS = {
     "starmie": starmie_set_deck,
 }
 
-ACTIVE_AGENT = "crustle"
+ACTIVE_AGENT = "ppo_starmie"
 
 # deck.csv (next to main.py) is the active agent's deck: when switching
 # ACTIVE_AGENT, copy that agent's heuristics/<name>_agent/deck.csv over deck.csv.

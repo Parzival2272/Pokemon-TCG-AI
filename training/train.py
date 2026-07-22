@@ -115,5 +115,5 @@ if __name__ == "__main__":
         tensorboard_log="./ppo_cabt_logs/",
     )
 
-    model.learn(total_timesteps=7_000_000, callback=WinRateCallback())
+    model.learn(total_timesteps=5_000_000, callback=WinRateCallback())
     model.save("ppo_starmie_v2")
