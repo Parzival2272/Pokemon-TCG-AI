@@ -1,5 +1,6 @@
 import os
 
+import torch
 from sb3_contrib import MaskablePPO
 from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.monitor import Monitor
@@ -52,15 +53,57 @@ OPPONENT_POOL = [
     ("starmie", starmie_agent, _load_deck("heuristics/starmie_agent/deck.csv")),
 ]
 
+# Which device MaskablePPO trains the policy/value networks on. Defaults to
+# "cpu" -- measured on this repo (see the DEVICE=cuda vs DEVICE=cpu smoke
+# test in conversation/PR history), "cuda" is 8x+ SLOWER here despite a real
+# GPU being available, because rollout collection calls the policy once per
+# env step (thousands of tiny sequential forward passes to pick each
+# action), and per-call CUDA kernel-launch/sync overhead (especially bad
+# under Windows' WDDM driver model) dwarfs the actual compute for a network
+# this small (MlpPolicy's default 64x64 layers). GPU would only help if the
+# network were much bigger or rollout collection were batched, neither of
+# which is true here. Override via the DEVICE env var, e.g. `DEVICE=cuda
+# python -m training.train`, if that ever changes -- N_ENVS/BATCH_SIZE/
+# N_EPOCHS below scale themselves to whichever device is chosen. Only
+# affects where the neural net does its forward/backward passes -- the
+# N_ENVS game-engine workers below always run on CPU regardless.
+DEVICE = os.environ.get("DEVICE", "cpu")
+if DEVICE == "cuda" and not torch.cuda.is_available():
+    print("DEVICE=cuda requested but no CUDA GPU is available; falling back to cpu.")
+    DEVICE = "cpu"
+
+# Two hyperparameter profiles, selected by DEVICE. CPU is this repo's
+# original, proven configuration -- unchanged. CUDA is a separate profile
+# for when the policy/value networks grow enough (more/wider layers, a
+# CNN/LSTM feature extractor, etc.) for a GPU to actually win: bigger
+# batch_size and n_epochs so a GPU update pass gets large, dense matmuls,
+# one less CPU core reserved for the game-engine workers since the main
+# process's own compute moves to the GPU, and policy_kwargs as the hook for
+# a larger net_arch once the model itself grows. It is NOT yet a proven win
+# -- see the DEVICE comment above for the measured 8x+ slowdown on today's
+# tiny MlpPolicy -- this profile exists so switching DEVICE="cuda" is a
+# single flag flip once the model is heavy enough to justify it, instead of
+# a re-tune at that point.
+_CPU_PROFILE = dict(reserved_cores=2, batch_size=64, n_epochs=10, policy_kwargs=None)
+_GPU_PROFILE = dict(
+    reserved_cores=1,
+    batch_size=2048,
+    n_epochs=15,
+    policy_kwargs=None,  # e.g. dict(net_arch=[256, 256]) once the model grows
+)
+_profile = _GPU_PROFILE if DEVICE == "cuda" else _CPU_PROFILE
+
 # Each worker runs the native game engine in its own OS process, since
 # Battle.battle_ptr in ptcg/sim.py is global mutable state shared within a
 # process -- multiple envs in one process would clobber each other's battle.
 # Worker count is a CPU-bound decision (each worker is one OS process
-# stepping the native engine), not a GPU one -- it scales with cores on
-# whatever machine this runs on, leaving a couple of cores free for the OS
-# and the main training process. Override via the N_ENVS env var if you want
-# a fixed count instead.
-N_ENVS = int(os.environ.get("N_ENVS", max(1, (os.cpu_count() or 4) - 2)))
+# stepping the native engine) -- it scales with cores on whatever machine
+# this runs on, minus reserved_cores (see profiles above) for the OS and
+# (on CPU) the main process's own policy forward/backward passes. Override
+# via the N_ENVS env var if you want a fixed count instead.
+N_ENVS = int(
+    os.environ.get("N_ENVS", max(1, (os.cpu_count() or 4) - _profile["reserved_cores"]))
+)
 
 # Split workers between pure self-play (free exploration, both sides RL) and
 # a heuristic opponent (directly optimizes for beating the known baselines --
@@ -68,10 +111,16 @@ N_ENVS = int(os.environ.get("N_ENVS", max(1, (os.cpu_count() or 4) - 2)))
 N_SELFPLAY_ENVS = N_ENVS // 6
 N_HEURISTIC_ENVS = N_ENVS - N_SELFPLAY_ENVS
 
-# Keep total samples collected per policy update roughly constant regardless
-# of N_ENVS, rather than letting it balloon (or shrink) with worker count.
-TARGET_SAMPLES_PER_UPDATE = 2048
+# 2048 steps/env is the standard PPO rollout length, so total buffer size
+# scales with N_ENVS instead of being held constant.
+TARGET_SAMPLES_PER_UPDATE = 2048 * N_ENVS
 N_STEPS = max(TARGET_SAMPLES_PER_UPDATE // N_ENVS, 1)
+
+# Minibatch size for each gradient step, and passes over each rollout
+# buffer per update -- both overridable via env vars regardless of profile.
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", _profile["batch_size"]))
+N_EPOCHS = int(os.environ.get("N_EPOCHS", _profile["n_epochs"]))
+POLICY_KWARGS = _profile["policy_kwargs"]
 
 
 def mask_fn(env):
@@ -100,14 +149,18 @@ if __name__ == "__main__":
     ] * N_HEURISTIC_ENVS
     env = SubprocVecEnv(env_fns)
 
+    print(f"Training on device: {DEVICE}")
+
     model = MaskablePPO(
         "MlpPolicy",
         env,
         verbose=1,
+        device=DEVICE,
         learning_rate=3e-4,
         n_steps=N_STEPS,  # N_STEPS * N_ENVS ~= TARGET_SAMPLES_PER_UPDATE
-        batch_size=64,
-        n_epochs=10,
+        batch_size=BATCH_SIZE,
+        n_epochs=N_EPOCHS,
+        policy_kwargs=POLICY_KWARGS,
         gamma=0.995,
         # SB3's default is 0.0; a small entropy bonus keeps the policy
         # exploring instead of collapsing onto one action pattern early.

@@ -2,6 +2,10 @@ gymnasium==1.2.0
 numpy==2.4.6
 stable-baselines3==2.9.0
 sb3-contrib==2.9.0
-torch==2.12.1
+# CUDA-enabled build (matches the driver's CUDA 13.x on this machine). Plain
+# `pip install torch==2.12.1` pulls the CPU-only wheel from PyPI instead --
+# install this one explicitly:
+#   pip install torch==2.12.1+cu130 --index-url https://download.pytorch.org/whl/cu130
+torch==2.12.1+cu130
 tensorboard==2.21.0
 kaggle-environments==1.30.1
