@@ -1,26 +1,29 @@
-"""Inference wrapper that exposes the trained ppo_starmie_v2 policy as an
-`agent(obs_dict) -> list[int]` callable, matching the other heuristic agent's
+"""Inference wrapper that exposes the trained MaskablePPO starmie policy as an
+`agent(obs_dict) -> list[int]` callable, matching the heuristic agents'
 interface so it can be dropped into main.py's AGENTS dict.
 
-Runs on plain NumPy weights (ppo_starmie_v2_weights.npz) rather than loading
-the sb3_contrib MaskablePPO .zip directly: Kaggle's submission sandbox does
-not have torch/sb3_contrib/stable_baselines3 installed (confirmed by a failed
-submission -- ModuleNotFoundError: No module named 'sb3_contrib'), so the
-agent must not depend on them at runtime. The weights were extracted from
-ppo_starmie_v2.zip's policy_net + action_net (see tools/export_policy_weights.py)
-and the forward pass below is a hand-written, NumPy-only reimplementation of
-MaskableActorCriticPolicy's deterministic action selection -- verified to
-produce IDENTICAL selections to the real torch model across 2,120 real
-in-game decisions (40 games vs every heuristic opponent) before being wired
-in here. If ppo_starmie_v2 is retrained, re-export the weights with that tool;
-this module doesn't touch the .zip.
+Runs on plain NumPy weights (an .npz exported by tools/export_policy_weights.py)
+rather than loading the sb3_contrib MaskablePPO .zip directly: Kaggle's
+submission sandbox has no torch/sb3_contrib/stable_baselines3 (confirmed by a
+failed submission -- ModuleNotFoundError: No module named 'sb3_contrib'), so
+this module must not import them at runtime. The forward pass below is a
+NumPy-only reimplementation of the policy's deterministic (greedy) action
+selection. Point it at a different export via the PPO_WEIGHTS env var, and
+re-export after every retrain so the submission bundle matches the model.
 
-Network shape (MlpPolicy default, extracted from ppo_starmie_v2.zip):
-    obs (300,) -> Linear(300,64) -> Tanh -> Linear(64,64) -> Tanh
-               -> Linear(64,256) -> reshape (128, 2) per-slot logits
-For slot i, "selected" wins over "not selected" iff logits[i,1] > logits[i,0]
-(argmax of a 2-way softmax, which softmax's monotonicity makes equivalent to
-comparing raw logits directly -- no need to materialize probabilities).
+The action space is autoregressive Discrete(MAX_OPTIONS + 1) (see
+training/cabt_env.py): the policy picks ONE option per forward pass, or the STOP
+action (index MAX_OPTIONS) to finish, and a decision needing k picks is a
+sequence of k greedy passes. A single engine `select` wants the whole subset at
+once, so this wrapper produces it by looping the network internally -- feeding
+each pass the partial selection via obs_to_vector(obs_dict, picked=...) -- the
+same rollout CabtEnv performs across gym steps during training.
+
+Network shape (MlpPolicy default):
+    obs (VECTOR_SIZE,) -> Linear(.,64) -> Tanh -> Linear(64,64) -> Tanh
+                       -> Linear(64, MAX_OPTIONS + 1) logits
+The chosen action is argmax over the currently-legal logits (masking is
+monotone-safe, so comparing raw logits matches comparing softmax probabilities).
 """
 
 import os
@@ -65,10 +68,12 @@ if _W0.shape[1] != VECTOR_SIZE:
         "Re-export the weights (tools/export_policy_weights.py) or check "
         "out the matching obs_vectorizer."
     )
-if _WA.shape[0] != MAX_OPTIONS * 2:
+if _WA.shape[0] != MAX_OPTIONS + 1:
     raise RuntimeError(
         f"{os.path.basename(_weights_path)} action head produces "
-        f"{_WA.shape[0]} logits, but MAX_OPTIONS*2 = {MAX_OPTIONS * 2}."
+        f"{_WA.shape[0]} logits, but MAX_OPTIONS + 1 = {MAX_OPTIONS + 1}. "
+        "This weights file is from the old MultiBinary policy; retrain on the "
+        "autoregressive Discrete CabtEnv and re-export."
     )
 
 
@@ -80,31 +85,36 @@ def set_deck(deck_list: list[int]) -> None:
 
 
 def _predict(obs_dict: dict, n_options: int, min_count: int, max_count: int) -> list[int]:
-    obs_vec = obs_to_vector(obs_dict)
+    """Greedily roll out the autoregressive policy for one engine `select`,
+    returning the chosen option indices. Mirrors CabtEnv.step /
+    CabtEnv.action_masks: pick one legal option per pass, feeding the partial
+    selection back in, until STOP is chosen or maxCount is reached."""
+    picked: list[int] = []
+    while True:
+        obs_vec = obs_to_vector(obs_dict, picked=picked)
+        h1 = np.tanh(obs_vec @ _W0.T + _B0)
+        h2 = np.tanh(h1 @ _W2.T + _B2)
+        logits = h2 @ _WA.T + _BA  # (MAX_OPTIONS + 1,)
 
-    h1 = np.tanh(obs_vec @ _W0.T + _B0)
-    h2 = np.tanh(h1 @ _W2.T + _B2)
-    logits = (h2 @ _WA.T + _BA).reshape(MAX_OPTIONS, 2)
+        # Legal-action mask, identical to CabtEnv.action_masks(): unpicked real
+        # options while the selection isn't full, plus STOP once minCount met.
+        legal = np.zeros(MAX_OPTIONS + 1, dtype=bool)
+        if len(picked) < max_count:
+            for i in range(n_options):
+                if i not in picked:
+                    legal[i] = True
+        if len(picked) >= min_count:
+            legal[MAX_OPTIONS] = True
 
-    # Only the first n_options slots correspond to real options -- mirrors
-    # CabtEnv.action_masks(), where "selected" is only ever legal there.
-    selected = [i for i in range(n_options) if logits[i, 1] > logits[i, 0]]
+        action = int(np.argmax(np.where(legal, logits, -np.inf)))
+        if action == MAX_OPTIONS:  # STOP
+            break
+        picked.append(action)
+        if len(picked) >= max_count:
+            break
 
-    # Same minCount/maxCount clamping CabtEnv.step() applies during training,
-    # since the per-slot choice can't jointly enforce a selection count.
-    if len(selected) > max_count:
-        selected = selected[:max_count]
-    if len(selected) < min_count:
-        chosen = set(selected)
-        for i in range(n_options):
-            if len(selected) >= min_count:
-                break
-            if i not in chosen:
-                selected.append(i)
-                chosen.add(i)
-        selected.sort()
-
-    return selected
+    picked.sort()
+    return picked
 
 
 def agent(obs_dict: dict) -> list[int]:
@@ -116,8 +126,8 @@ def agent(obs_dict: dict) -> list[int]:
     n_options = min(len(options), MAX_OPTIONS)
     if n_options == 0:
         return []
-    min_count = min(select.get("minCount", 1), n_options)
     max_count = min(select.get("maxCount", 1), n_options)
+    min_count = min(select.get("minCount", 1), max_count)
 
     # Competition rule: the agent must never crash and must always return a
     # legal action. A bad/malformed observation or an unexpected exception

@@ -1,4 +1,6 @@
 import os
+import time
+from datetime import timedelta
 
 import torch
 from sb3_contrib import MaskablePPO
@@ -6,8 +8,9 @@ from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from training.cabt_env import CabtEnv
-from training.callbacks import WinRateCallback
+from training.cabt_env import DECK_PATH, CabtEnv
+from training.callbacks import SnapshotCallback, WinRateCallback
+from training.league import SnapshotOpponentPool
 
 from heuristics.crustle_agent import agent as crustle_agent
 from heuristics.abomasnow_agent import agent as abomasnow_agent
@@ -105,11 +108,25 @@ N_ENVS = int(
     os.environ.get("N_ENVS", max(1, (os.cpu_count() or 4) - _profile["reserved_cores"]))
 )
 
-# Split workers between pure self-play (free exploration, both sides RL) and
+# League self-play: SnapshotCallback freezes the live policy into
+# SNAPSHOT_DIR every SNAPSHOT_FREQ timesteps (plus once at training start),
+# keeping the newest MAX_SNAPSHOTS; league envs draw a random frozen snapshot
+# each episode (mirror match on the learner's deck). Unlike the old pure
+# self-play envs -- where both sides fed one rollout stream and GAE
+# bootstrapped values across perspective flips -- every league transition is
+# the learner's own, so the PPO update is correct, and playing recent past
+# selves still gives self-play curriculum (win_rate/league ~50% is healthy).
+SNAPSHOT_DIR = "./league_snapshots"
+SNAPSHOT_FREQ = 100_000
+MAX_SNAPSHOTS = 5
+
+# Split workers between league self-play (vs frozen snapshots, see above) and
 # a heuristic opponent (directly optimizes for beating the known baselines --
-# a random one from OPPONENT_POOL each episode). Must sum to N_ENVS.
-N_SELFPLAY_ENVS = N_ENVS // 6
-N_HEURISTIC_ENVS = N_ENVS - N_SELFPLAY_ENVS
+# a random one from OPPONENT_POOL each episode). Must sum to N_ENVS. League
+# gets a bigger share than the old pure self-play split (1/6) since its
+# gradients are now correct; tune if heuristic win rates stall.
+N_LEAGUE_ENVS = N_ENVS // 4
+N_HEURISTIC_ENVS = N_ENVS - N_LEAGUE_ENVS
 
 # 2048 steps/env is the standard PPO rollout length, so total buffer size
 # scales with N_ENVS instead of being held constant.
@@ -127,8 +144,14 @@ def mask_fn(env):
     return env.action_masks()
 
 
-def make_selfplay_env():
-    env = CabtEnv()
+def make_league_env():
+    # The pool is a callable, re-scanned each episode, so snapshots saved
+    # mid-run join the league (empty dir -> pure self-play fallback, only
+    # before the initial snapshot lands). Snapshots pilot the learner's own
+    # deck: a mirror match, which is also what they were trained on.
+    env = CabtEnv(
+        opponent_agents=SnapshotOpponentPool(SNAPSHOT_DIR, _load_deck(DECK_PATH))
+    )
     env = ActionMasker(env, mask_fn)
     # info_keywords lifts CabtEnv's per-episode "opponent" tag into
     # info["episode"] so WinRateCallback can read it.
@@ -144,7 +167,7 @@ def make_heuristic_env():
 
 
 if __name__ == "__main__":
-    env_fns = [make_selfplay_env] * N_SELFPLAY_ENVS + [
+    env_fns = [make_league_env] * N_LEAGUE_ENVS + [
         make_heuristic_env
     ] * N_HEURISTIC_ENVS
     env = SubprocVecEnv(env_fns)
@@ -168,5 +191,60 @@ if __name__ == "__main__":
         tensorboard_log="./ppo_cabt_logs/",
     )
 
-    model.learn(total_timesteps=5_000_000, callback=WinRateCallback())
+    # Warm start: BC_INIT=<path.zip> copies the policy weights (actor AND
+    # value head) out of a behavior-cloned model (training/bc.py) so PPO
+    # starts from "imitates the starmie heuristic" instead of random. Only
+    # the network weights are taken -- optimizer state and PPO hyperparams
+    # stay fresh from the model built above. The initial league snapshot
+    # (SnapshotCallback at training start) then captures the BC policy too.
+    bc_init = os.environ.get("BC_INIT")
+    if bc_init:
+        from stable_baselines3.common.save_util import load_from_zip_file
+
+        _, params, _ = load_from_zip_file(bc_init, device=DEVICE)
+        model.policy.load_state_dict(params["policy"])
+        print(f"Warm-started policy from {bc_init}")
+
+    total_timesteps = 5_000_000
+    win_rate_cb = WinRateCallback()
+    snapshot_cb = SnapshotCallback(
+        SNAPSHOT_DIR, SNAPSHOT_FREQ, max_snapshots=MAX_SNAPSHOTS, verbose=1
+    )
+
+    start = time.perf_counter()
+    model.learn(total_timesteps=total_timesteps, callback=[win_rate_cb, snapshot_cb])
+    elapsed = time.perf_counter() - start
+
     model.save("ppo_starmie_v2")
+
+    # ---- End-of-training report -------------------------------------------
+    steps_done = model.num_timesteps
+    avg_fps = steps_done / elapsed if elapsed > 0 else float("nan")
+
+    summary = win_rate_cb.summary()
+    total_games = summary.get("overall", (0, 0))[1]
+
+    print("\n" + "=" * 60)
+    print("TRAINING REPORT")
+    print("=" * 60)
+    print(f"Device               : {DEVICE}")
+    print(f"Parallel envs        : {N_ENVS}")
+    print(f"Timesteps            : {steps_done:,} / {total_timesteps:,}")
+    print(f"Wall-clock time      : {timedelta(seconds=round(elapsed))} ({elapsed:.1f}s)")
+    print(f"Average FPS          : {avg_fps:,.0f} steps/s")
+    print(f"Per-env FPS          : {avg_fps / N_ENVS:,.0f} steps/s")
+    print(f"Episodes completed   : {total_games:,}")
+    if elapsed > 0:
+        print(f"Episodes/hour        : {total_games / elapsed * 3600:,.0f}")
+
+    print("\nWin rate (career, cumulative over run):")
+    # Overall first, then per-opponent sorted worst matchup first.
+    overall = summary.pop("overall", None)
+    if overall is not None:
+        w, g = overall
+        print(f"  {'overall':<16}: {w / g:6.1%}  ({w:,}/{g:,})" if g else "  overall: n/a")
+    for name, (w, g) in sorted(summary.items(), key=lambda kv: kv[1][0] / kv[1][1] if kv[1][1] else 0):
+        if g:
+            print(f"  {name:<16}: {w / g:6.1%}  ({w:,}/{g:,})")
+    print("=" * 60)
+    print("Saved model to ppo_starmie_v2.zip")

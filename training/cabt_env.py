@@ -60,13 +60,21 @@ class CabtEnv(gym.Env):
 
     OBS_SIZE = VECTOR_SIZE
     MAX_OPTIONS = MAX_OPTIONS
+    # Action index MAX_OPTIONS is the "stop / finish selection" action; indices
+    # 0..MAX_OPTIONS-1 pick the corresponding option.
+    STOP_ACTION = MAX_OPTIONS
 
     def __init__(self, opponent_agents=None):
         """
         Args:
-            opponent_agents: Optional pool of heuristic opponents. Either None
+            opponent_agents: Optional pool of opponents. Either None
                 (pure self-play -- both sides are the RL policy, both playing
-                the DECK_PATH deck) or a list of (name, agent_fn, deck) tuples.
+                the DECK_PATH deck), a list of (name, agent_fn, deck) tuples,
+                or a zero-arg callable returning such a list. A callable is
+                re-evaluated at every reset(), so the pool can change mid-run
+                (e.g. league snapshots saved while training -- see
+                training/league.py); if it returns an empty list the episode
+                falls back to pure self-play.
                 When a pool is given, one opponent is chosen uniformly at
                 random each episode; it controls one side (the learner's side
                 is randomized) and pilots its own `deck`, while the learner
@@ -78,10 +86,15 @@ class CabtEnv(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=0, high=1, shape=(self.OBS_SIZE,), dtype=np.float32
         )
-        # A subset of the MAX_OPTIONS slots is selected per step, since some
-        # decisions require choosing 0, 2, or any other count of options at
-        # once (see SelectData.minCount/maxCount), not just exactly 1.
-        self.action_space = gym.spaces.MultiBinary(self.MAX_OPTIONS)
+        # Autoregressive selection: each step picks ONE option (0..MAX_OPTIONS-1)
+        # or STOP_ACTION to finish. A decision needing k picks (discard 2, choose
+        # 3 prizes, ...) is spread over k steps, and STOP finalizes once the
+        # count is legal. This replaces the old MultiBinary(MAX_OPTIONS), where
+        # the policy couldn't enforce the required count jointly and the env had
+        # to clamp the sampled subset after the fact -- training PPO on a
+        # different action than was executed. A single n-way choice is now one
+        # masked categorical instead of MAX_OPTIONS independent Bernoullis.
+        self.action_space = gym.spaces.Discrete(self.MAX_OPTIONS + 1)
 
         self._opponent_agents = opponent_agents
         # Per-episode opponent, chosen in reset() (None while in self-play).
@@ -92,6 +105,8 @@ class CabtEnv(gym.Env):
         self._n_options = 0
         self._min_count = 0
         self._max_count = 0
+        # Options picked so far in the current decision (reset at each decision).
+        self._picked: list[int] = []
 
     def _play_opponent_until_learner_turn(self, obs_dict):
         """Auto-play the non-learner side with `opponent_agent` until it's
@@ -132,8 +147,12 @@ class CabtEnv(gym.Env):
                 stacklevel=2,
             )
         self._n_options = min(len(options), self.MAX_OPTIONS)
-        self._min_count = min(select.get("minCount", 1), self._n_options)
         self._max_count = min(select.get("maxCount", 1), self._n_options)
+        # Clamp min <= max so the STOP action is always reachable (guards
+        # against any odd engine data where minCount > available options).
+        self._min_count = min(select.get("minCount", 1), self._max_count)
+        # Starting a fresh decision: nothing picked yet.
+        self._picked = []
 
     def reset(self, seed=None, options=None):
         # Start a new CABT game (self-play by default; vs opponent_agent if set)
@@ -153,13 +172,18 @@ class CabtEnv(gym.Env):
         # the vectorizer deck is the learner's deck regardless of opponent.
         set_vectorizer_deck(learner_deck)
 
-        if self._opponent_agents:
+        # A callable pool is re-evaluated every episode so it can grow/shrink
+        # mid-run (league snapshots); a plain list is used as-is.
+        pool = (
+            self._opponent_agents()
+            if callable(self._opponent_agents)
+            else self._opponent_agents
+        )
+        if pool:
             # Pick a fresh opponent for this episode; it pilots its own deck.
-            self._opponent_name, self._opponent_agent, opp_deck = (
-                self._opponent_agents[
-                    int(self.np_random.integers(0, len(self._opponent_agents)))
-                ]
-            )
+            self._opponent_name, self._opponent_agent, opp_deck = pool[
+                int(self.np_random.integers(0, len(pool)))
+            ]
             # Randomize which side the learner plays so it doesn't overfit
             # to always going first (or second).
             self._learner_index = int(self.np_random.integers(0, 2))
@@ -179,25 +203,51 @@ class CabtEnv(gym.Env):
             obs_dict = self._play_opponent_until_learner_turn(obs_dict)
         self._obs = obs_dict
         self._sync_select_state(obs_dict)
-        return obs_to_vector(obs_dict), {}
+        return obs_to_vector(obs_dict, picked=self._picked), {}
 
     def step(self, action):
         from ptcg.game import battle_select
 
-        # Learner's observation before this action -- the "before" state for
-        # prize-differential shaping (in heuristic mode it's always the
-        # learner's perspective, captured before self._obs is overwritten).
+        action = int(action)
+
+        # Decide whether this action finalizes the current selection or just
+        # adds one more pick to it.
+        if action == self.STOP_ACTION:
+            finalize = True
+        else:
+            # A pick. The mask should already forbid illegal picks, but guard
+            # anyway (out-of-range, duplicate, or past maxCount).
+            if (
+                0 <= action < self._n_options
+                and action not in self._picked
+                and len(self._picked) < self._max_count
+            ):
+                self._picked.append(action)
+            # maxCount reached -> the selection is complete, finalize now
+            # (no explicit STOP needed; keeps single-pick decisions one step).
+            finalize = len(self._picked) >= self._max_count
+
+        if not finalize:
+            # Intermediate sub-step: the engine has NOT advanced, so the board
+            # is unchanged and only the partial selection differs. No reward,
+            # not done -- the decision continues on the next step.
+            return (
+                obs_to_vector(self._obs, picked=self._picked),
+                0.0,
+                False,
+                False,
+                {},
+            )
+
+        # Learner's observation before the selection is submitted -- the
+        # "before" state for prize-differential shaping. The board is identical
+        # across this decision's sub-steps, so self._obs (the decision's start
+        # state) is the correct baseline.
         prev_obs = self._obs
 
-        # `action` is a MAX_OPTIONS-length 0/1 vector. Only the first
-        # n_options slots are meaningful; the rest are masked out. The native
-        # engine requires exactly minCount <= len(selected) <= maxCount, which
-        # the per-slot Bernoulli mask can't enforce jointly, so clamp here.
-        selected = [i for i in range(self._n_options) if action[i]]
         selected = _sanitize_selection(
-            selected, self._n_options, self._min_count, self._max_count
+            self._picked, self._n_options, self._min_count, self._max_count
         )
-
         obs_dict = battle_select(selected)
         if self._opponent_agent is not None:
             obs_dict = self._play_opponent_until_learner_turn(obs_dict)
@@ -210,7 +260,7 @@ class CabtEnv(gym.Env):
         result = current.get("result", -1)
 
         done = result >= 0
-        # The reward for this step belongs to the player who just acted. The
+        # The reward for this decision belongs to the player who just acted. The
         # rollout pairs it with prev_obs (the state the action was chosen
         # from), so "me" is that player, and compute_reward reads prizes /
         # decides win-loss from their (absolute) index.
@@ -230,7 +280,7 @@ class CabtEnv(gym.Env):
         info = {"opponent": self._opponent_name} if done else {}
 
         self._sync_select_state(obs_dict)
-        return obs_to_vector(obs_dict), reward, done, False, info
+        return obs_to_vector(obs_dict, picked=self._picked), reward, done, False, info
 
     def close(self):
         from ptcg.game import battle_finish
@@ -242,13 +292,20 @@ class CabtEnv(gym.Env):
         super().close()
 
     def action_masks(self) -> np.ndarray:
-        """Return a (MAX_OPTIONS, 2) mask for sb3-contrib's MaskablePPO.
+        """Return a (MAX_OPTIONS + 1,) boolean mask for MaskablePPO's Discrete
+        action space.
 
-        For each slot, column 0 is whether "not selected" is valid and
-        column 1 is whether "selected" is valid. Slots beyond n_options
-        don't correspond to a real option, so they're forced to 0.
+        A real option is legal to pick iff it isn't already picked and the
+        selection isn't full yet (len(picked) < maxCount). STOP is legal once at
+        least minCount options are picked. At least one action is always legal
+        when the env queries the policy: it only queries while
+        len(picked) < maxCount <= n_options, so some unpicked option remains.
         """
-        mask = np.zeros((self.MAX_OPTIONS, 2), dtype=bool)
-        mask[:, 0] = True
-        mask[: self._n_options, 1] = True
+        mask = np.zeros(self.MAX_OPTIONS + 1, dtype=bool)
+        if len(self._picked) < self._max_count:
+            for i in range(self._n_options):
+                if i not in self._picked:
+                    mask[i] = True
+        if len(self._picked) >= self._min_count:
+            mask[self.STOP_ACTION] = True
         return mask

@@ -19,12 +19,17 @@ CARD_ID_NORM = 2000.0
 POKE_FEATURES = 6
 # Energy-type histogram length (EnergyType enum: COLORLESS..TEAM_ROCKET = 0..11).
 N_ENERGY_TYPES = 12
-# Per-option features: option type, the card the option acts on, attack id.
-OPTION_FEATURES = 3
+# Per-option features: option type, the card the option acts on, attack id, and
+# a flag for whether this option is already picked in the current (possibly
+# multi-pick) selection -- the autoregressive action space picks one option per
+# step, so the policy needs to see what it has selected so far this decision.
+OPTION_FEATURES = 4
 # Special conditions per player's active: poisoned/burned/asleep/paralyzed/confused.
 COND_FEATURES = 5
-# Turn / resource / count scalars (see _state_block).
-STATE_FEATURES = 16
+# Turn / resource / count scalars (see _state_block). The last two are
+# autoregressive-selection progress: how many options are picked so far and
+# whether stopping is currently legal (picked >= minCount).
+STATE_FEATURES = 18
 # Log-derived temporal context (see _log_block): damage dealt/taken and each
 # side's last attack id, summarising events since the previous observation.
 LOG_FEATURES = 4
@@ -302,7 +307,15 @@ def _log_block(logs, your_index: int) -> list[float]:
     ]
 
 
-def _state_block(current: dict, select: dict, you: dict, opp: dict, your_index: int) -> list[float]:
+def _state_block(
+    current: dict,
+    select: dict,
+    you: dict,
+    opp: dict,
+    your_index: int,
+    picked_count: int,
+    can_stop: float,
+) -> list[float]:
     """Turn/resource/selection-count scalars (STATE_FEATURES long)."""
     return [
         (current.get("turn") or 0) / 100,
@@ -321,16 +334,34 @@ def _state_block(current: dict, select: dict, you: dict, opp: dict, your_index: 
         (select.get("maxCount") or 0) / 16,
         (select.get("remainDamageCounter") or 0) / 20,
         (select.get("remainEnergyCost") or 0) / 8,
+        picked_count / 16,  # options picked so far this (multi-pick) decision
+        can_stop,  # 1.0 iff finishing the selection now is legal
     ]
 
 
-def obs_to_vector(obs_dict: dict) -> np.ndarray:
+def obs_to_vector(obs_dict: dict, picked=()) -> np.ndarray:
+    """Vectorize an observation.
+
+    Args:
+        obs_dict: the raw engine observation.
+        picked: option indices already chosen in the current decision. The
+            action space is autoregressive -- one option is picked per step
+            until the selection is finalized -- so the observation must encode
+            the partial selection (which options are taken and whether stopping
+            is legal yet) to stay Markov across a multi-pick decision. Empty for
+            single-pick decisions and at the start of every decision.
+    """
     current = obs_dict.get("current") or {}
     your_index = current.get("yourIndex", 0)
     players = current.get("players", [{}, {}])
     you = players[your_index] if len(players) > your_index else {}
     opp = players[1 - your_index] if len(players) > 1 else {}
     select = obs_dict.get("select") or {}
+
+    picked_set = set(picked)
+    n_opt = min(len(select.get("option") or []), MAX_OPTIONS)
+    min_count_eff = min(int(select.get("minCount") or 0), n_opt)
+    can_stop = 1.0 if len(picked_set) >= min_count_eff else 0.0
 
     # Active pokemon (yours + opponent's)
     your_active = (you.get("active") or [None])[0]
@@ -361,13 +392,15 @@ def obs_to_vector(obs_dict: dict) -> np.ndarray:
     # Select context (what kind of decision is this?)
     context = (select.get("context") or 0) / 50
 
-    # Per-option block: type, the card the option acts on, and attack id.
+    # Per-option block: type, the card the option acts on, attack id, and a
+    # flag for whether this option is already picked this decision.
     options = select.get("option") or []
     opt_block: list[float] = []
-    for o in options[:MAX_OPTIONS]:
+    for idx, o in enumerate(options[:MAX_OPTIONS]):
         opt_block.append((o.get("type") or 0) / 16)
         opt_block.append(_option_card_id(obs_dict, current, o, your_index) / CARD_ID_NORM)
         opt_block.append((o.get("attackId") or 0) / CARD_ID_NORM)
+        opt_block.append(1.0 if idx in picked_set else 0.0)
     opt_block += [0.0] * (OPTION_FEATURES * MAX_OPTIONS - len(opt_block))
 
     vec = (
@@ -381,7 +414,9 @@ def obs_to_vector(obs_dict: dict) -> np.ndarray:
         + deck_slot_flags  # MAX_DECK_SLOTS
         + _cond_vec(you)  # COND_FEATURES
         + _cond_vec(opp)  # COND_FEATURES
-        + _state_block(current, select, you, opp, your_index)  # STATE_FEATURES
+        + _state_block(
+            current, select, you, opp, your_index, len(picked_set), can_stop
+        )  # STATE_FEATURES
         + _log_block(obs_dict.get("logs"), your_index)  # LOG_FEATURES
         + [your_prizes, opp_prizes, stadium_id, context]  # 4
         + opt_block  # OPTION_FEATURES * MAX_OPTIONS
