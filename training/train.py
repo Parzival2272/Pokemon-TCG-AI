@@ -1,4 +1,6 @@
 import os
+import time
+from datetime import timedelta
 
 import torch
 from sb3_contrib import MaskablePPO
@@ -168,5 +170,43 @@ if __name__ == "__main__":
         tensorboard_log="./ppo_cabt_logs/",
     )
 
-    model.learn(total_timesteps=5_000_000, callback=WinRateCallback())
+    total_timesteps = 5_000_000
+    win_rate_cb = WinRateCallback()
+
+    start = time.perf_counter()
+    model.learn(total_timesteps=total_timesteps, callback=win_rate_cb)
+    elapsed = time.perf_counter() - start
+
     model.save("ppo_starmie_v2")
+
+    # ---- End-of-training report -------------------------------------------
+    steps_done = model.num_timesteps
+    avg_fps = steps_done / elapsed if elapsed > 0 else float("nan")
+
+    summary = win_rate_cb.summary()
+    total_games = summary.get("overall", (0, 0))[1]
+
+    print("\n" + "=" * 60)
+    print("TRAINING REPORT")
+    print("=" * 60)
+    print(f"Device               : {DEVICE}")
+    print(f"Parallel envs        : {N_ENVS}")
+    print(f"Timesteps            : {steps_done:,} / {total_timesteps:,}")
+    print(f"Wall-clock time      : {timedelta(seconds=round(elapsed))} ({elapsed:.1f}s)")
+    print(f"Average FPS          : {avg_fps:,.0f} steps/s")
+    print(f"Per-env FPS          : {avg_fps / N_ENVS:,.0f} steps/s")
+    print(f"Episodes completed   : {total_games:,}")
+    if elapsed > 0:
+        print(f"Episodes/hour        : {total_games / elapsed * 3600:,.0f}")
+
+    print("\nWin rate (career, cumulative over run):")
+    # Overall first, then per-opponent sorted worst matchup first.
+    overall = summary.pop("overall", None)
+    if overall is not None:
+        w, g = overall
+        print(f"  {'overall':<16}: {w / g:6.1%}  ({w:,}/{g:,})" if g else "  overall: n/a")
+    for name, (w, g) in sorted(summary.items(), key=lambda kv: kv[1][0] / kv[1][1] if kv[1][1] else 0):
+        if g:
+            print(f"  {name:<16}: {w / g:6.1%}  ({w:,}/{g:,})")
+    print("=" * 60)
+    print("Saved model to ppo_starmie_v2.zip")

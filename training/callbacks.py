@@ -40,3 +40,11 @@ class WinRateCallback(BaseCallback):
         for key, games in self._games.items():
             if games:
                 self.logger.record(f"win_rate/{key}", self._wins[key] / games)
+
+    def summary(self) -> dict[str, tuple[int, int]]:
+        """Return {opponent: (wins, games)} over the whole run.
+
+        "overall" is included as the aggregate across every opponent. Used by
+        the end-of-training report in train.py.
+        """
+        return {key: (self._wins[key], games) for key, games in self._games.items()}
