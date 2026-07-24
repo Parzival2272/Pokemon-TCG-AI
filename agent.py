@@ -35,7 +35,12 @@ from training.obs_vectorizer import (
 )
 
 _project_root = os.path.dirname(os.path.abspath(__file__))
-_weights_path = os.path.join(_project_root, "ppo_starmie_v2_weights.npz")
+# Kaggle submission always runs the v2 weights (the default). Local tooling
+# (e.g. local_test.py running v3 vs itself) can point this at a different
+# export via the PPO_WEIGHTS env var without touching the submission default.
+_weights_path = os.environ.get(
+    "PPO_WEIGHTS", os.path.join(_project_root, "ppo_starmie_v2_weights.npz")
+)
 _deck_path = os.path.join(_project_root, "deck.csv")
 
 with open(_deck_path) as _f:
