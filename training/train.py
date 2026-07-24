@@ -247,4 +247,4 @@ if __name__ == "__main__":
         if g:
             print(f"  {name:<16}: {w / g:6.1%}  ({w:,}/{g:,})")
     print("=" * 60)
-    print("Saved model to ppo_starmie_v2.zip")
+    print("Saved model to ppo_starmie_v7.zip")
