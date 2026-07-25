@@ -42,6 +42,18 @@ OPT_CARD_FEATURES = 14
 # very differently by the expert but were otherwise identical in the vector.
 OPT_TARGET_FEATURES = 5
 OPTION_FEATURES = OPT_BASE_FEATURES + OPT_CARD_FEATURES + OPT_TARGET_FEATURES
+
+# Semantic attributes (OPT_CARD_FEATURES each) of the OPPONENT's Pokemon --
+# active + bench. The heuristics read opponent card attributes (Water weakness,
+# ex/mega, evolution stage, HP) to choose attackers and decide the Nebula Beam
+# plan, but the vector otherwise encodes opponent Pokemon as raw ids only, so
+# MAIN-phase attack/attach/evolve decisions were still partly unobservable.
+OPP_SEMANTIC_SLOTS = 1 + MAX_BENCH  # active + bench
+# Expert-derived matchup signals (privileged distillation): whether the Nebula
+# Beam plan is needed and whether Mega Froslass ex is the preferred attacker.
+# The opponent-semantic block above already exposes the raw inputs to these, so
+# these two just hand the net the heuristic's own thresholded conclusions.
+MATCHUP_FEATURES = 2
 # Special conditions per player's active: poisoned/burned/asleep/paralyzed/confused.
 COND_FEATURES = 5
 # Turn / resource / count scalars (see _state_block). The last two are
@@ -63,6 +75,8 @@ VECTOR_SIZE = (
     + LOG_FEATURES  # recent damage / last attacks from the event log
     + 4  # your_prizes, opp_prizes, stadium_id, context
     + MAX_UNIQUE_CARDS  # per-unique-card unseen-copies belief
+    + OPT_CARD_FEATURES * OPP_SEMANTIC_SLOTS  # opponent active + bench semantics
+    + MATCHUP_FEATURES  # need_nebula, froslass-preferred
     + OPTION_FEATURES * MAX_OPTIONS  # per-option base + card-semantic + target
 )
 
@@ -128,6 +142,59 @@ def _card_semantic_feats(data) -> list[float]:
 # id -> precomputed semantic feature list; unknown ids fall back to zeros.
 _CARD_FEATS = {cid: _card_semantic_feats(d) for cid, d in _CARD_DB.items()}
 _ZERO_CARD_FEATS = [0.0] * OPT_CARD_FEATURES
+
+# Indices into a card's semantic feature list (see _card_semantic_feats order).
+_F_STAGE1, _F_STAGE2, _F_EX, _F_MEGA, _F_WATER_WEAK = 7, 8, 9, 10, 11
+
+# Starmie-deck matchup constants (the same Crustle line the heuristic keys on;
+# 344/345/532 = the Crustle evolution line that walls Rule Box attackers). Kept
+# local so the derived matchup signals below are a cheap dict/threshold check
+# rather than a call back into the expert (which would rebuild the observation
+# dataclass every step -- far too costly on the vectorization hot path).
+_CRUSTLE_LINE = {344, 345, 532}
+
+
+def _mon_semantic(mon) -> list[float]:
+    """Semantic feature list of a board Pokemon (zeros for an empty slot)."""
+    if not mon:
+        return _ZERO_CARD_FEATS
+    return _CARD_FEATS.get(mon.get("id"), _ZERO_CARD_FEATS)
+
+
+def _matchup_globals(opp: dict, opp_active) -> list[float]:
+    """The heuristic's two derived matchup conclusions, recomputed cheaply from
+    the raw obs: need_nebula (Nebula Beam plan required) and froslass_preferred
+    (Mega Froslass ex is the better attacker this matchup). Mirrors
+    starmie_agent.need_nebula / preferred_mega."""
+    opp_mons = [m for m in ([opp_active] + list(opp.get("bench") or [])) if m]
+
+    # need_nebula: vs the Crustle wall, or an Active too fat for Jetting Blow
+    # (120, doubled to 240 into a Water-weak Active).
+    crustle = any(m.get("id") in _CRUSTLE_LINE for m in opp_mons)
+    if crustle:
+        need_nebula = 1.0
+    elif opp_active:
+        feats = _CARD_FEATS.get(opp_active.get("id"), _ZERO_CARD_FEATS)
+        jetting = 240 if feats[_F_WATER_WEAK] else 120
+        need_nebula = 1.0 if (opp_active.get("hp") or 0) > jetting else 0.0
+    else:
+        need_nebula = 0.0
+
+    # preferred_mega: Froslass if the opponent board is mostly big/evolved,
+    # else Starmie (which snipes small evolving basics).
+    evolving = big = 0
+    for m in opp_mons:
+        feats = _CARD_FEATS.get(m.get("id"), _ZERO_CARD_FEATS)
+        maxhp = m.get("maxHp") or m.get("hp") or 0
+        if feats[_F_STAGE1] or feats[_F_STAGE2] or feats[_F_MEGA]:
+            big += 1  # fully evolved
+        elif feats[_F_EX] or maxhp >= 130:
+            big += 1  # big basic (basic ex / tank)
+        else:
+            evolving += 1  # small basic that likely wants to evolve
+    froslass_preferred = 1.0 if big > evolving else 0.0
+
+    return [need_nebula, froslass_preferred]
 
 
 def visible_owned_card_ids(current: dict, your_index: int) -> list[int]:
@@ -524,6 +591,13 @@ def obs_to_vector(obs_dict: dict, picked=()) -> np.ndarray:
         opt_block.extend(_option_target_feats(obs_dict, current, o, your_index))
     opt_block += [0.0] * (OPTION_FEATURES * MAX_OPTIONS - len(opt_block))
 
+    # Opponent Pokemon semantics (active + bench) and the derived matchup
+    # signals the heuristic branches on.
+    opp_semantic = _mon_semantic(opp_active)
+    for m in opp_bench:
+        opp_semantic = opp_semantic + _mon_semantic(m)
+    matchup = _matchup_globals(opp, opp_active)
+
     vec = (
         _poke_vec(your_active)  # POKE_FEATURES
         + _poke_vec(opp_active)  # POKE_FEATURES
@@ -541,6 +615,8 @@ def obs_to_vector(obs_dict: dict, picked=()) -> np.ndarray:
         + _log_block(obs_dict.get("logs"), your_index)  # LOG_FEATURES
         + [your_prizes, opp_prizes, stadium_id, context]  # 4
         + deck_count_vec(obs_dict)  # MAX_UNIQUE_CARDS
+        + opp_semantic  # OPT_CARD_FEATURES * OPP_SEMANTIC_SLOTS
+        + matchup  # MATCHUP_FEATURES
         + opt_block  # OPTION_FEATURES * MAX_OPTIONS
     )
     assert len(vec) == VECTOR_SIZE, (len(vec), VECTOR_SIZE)

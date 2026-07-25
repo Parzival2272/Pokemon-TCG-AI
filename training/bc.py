@@ -156,11 +156,22 @@ def behavior_clone(
     lr=3e-4,
     vf_coef=0.5,
     ent_coef=0.0,
+    weight_decay=1e-4,
+    patience=8,
     device="cpu",
     seed=0,
 ):
     """Train a fresh MaskablePPO's policy to imitate `data`, save to
-    `out_path` (a normal MaskablePPO zip, loadable by train.py's BC_INIT)."""
+    `out_path` (a normal MaskablePPO zip, loadable by train.py's BC_INIT).
+
+    Saves the BEST-val-accuracy weights, not the final epoch's: the training
+    policy loss keeps falling long after val accuracy plateaus (overfitting),
+    so the last epoch is the most overfit. Stops early if val accuracy hasn't
+    improved for `patience` epochs. AdamW's `weight_decay` adds mild L2
+    regularization to widen the usable epoch window before overfit sets in.
+    """
+    import copy
+
     from sb3_contrib import MaskablePPO
     from sb3_contrib.common.wrappers import ActionMasker
 
@@ -191,7 +202,7 @@ def behavior_clone(
     act_t = th.as_tensor(data["actions"], device=dev)
     ret_t = th.as_tensor(data["returns"], device=dev)
 
-    optimizer = th.optim.Adam(policy.parameters(), lr=lr)
+    optimizer = th.optim.AdamW(policy.parameters(), lr=lr, weight_decay=weight_decay)
     policy.set_training_mode(True)
 
     print(
@@ -200,6 +211,12 @@ def behavior_clone(
     )
     baseline = _accuracy(policy, obs_t[val_idx], mask_t[val_idx], act_t[val_idx])
     print(f"  epoch  0: val accuracy {baseline:.1%} (untrained baseline)")
+
+    # Keep the best-val weights (CPU copy) so we can restore them before saving.
+    best_val = baseline
+    best_state = copy.deepcopy(policy.state_dict())
+    best_epoch = 0
+    epochs_since_best = 0
 
     for epoch in range(1, epochs + 1):
         perm = train_idx[rng.permutation(len(train_idx))]
@@ -226,16 +243,35 @@ def behavior_clone(
             total_vf += vf_loss.item()
             n_batches += 1
         val_acc = _accuracy(policy, obs_t[val_idx], mask_t[val_idx], act_t[val_idx])
+        improved = val_acc > best_val
+        if improved:
+            best_val = val_acc
+            best_state = copy.deepcopy(policy.state_dict())
+            best_epoch = epoch
+            epochs_since_best = 0
+        else:
+            epochs_since_best += 1
         print(
             f"  epoch {epoch:2d}: loss {total_loss / n_batches:.4f} "
             f"(policy {total_pg / n_batches:.4f}, value {total_vf / n_batches:.4f}), "
-            f"val accuracy {val_acc:.1%}"
+            f"val accuracy {val_acc:.1%}{'  <- best' if improved else ''}"
         )
+        if epochs_since_best >= patience:
+            print(
+                f"  early stop: no val improvement in {patience} epochs "
+                f"(best {best_val:.1%} @ epoch {best_epoch})"
+            )
+            break
 
+    # Restore and save the best-val weights, not the (more overfit) last epoch.
+    policy.load_state_dict(best_state)
     policy.set_training_mode(False)
     model.save(out_path)
     env.close()
-    print(f"Saved BC-initialized model to {out_path}.zip")
+    print(
+        f"Saved BC-initialized model (best val {best_val:.1%} @ epoch "
+        f"{best_epoch}) to {out_path}.zip"
+    )
     return model
 
 
@@ -244,14 +280,19 @@ def main():
         description="Behavior-clone the starmie heuristic into a MaskablePPO "
         "policy (see module docstring)."
     )
-    # Collection runs ~30 games/s single-process, so 2000 episodes (~80k
-    # samples) is well under two minutes.
-    parser.add_argument("--episodes", type=int, default=2000, help="games to collect")
-    # The loss/accuracy were still improving monotonically at epoch 20 in the
-    # original run, so it was undertrained; give it room to converge.
-    parser.add_argument("--epochs", type=int, default=60)
+    # Collection runs ~30 games/s single-process. More data is the main lever
+    # against the val plateau (train loss kept falling while val went flat), so
+    # default higher than the original 2000; ~6000 games is still a few minutes.
+    parser.add_argument("--episodes", type=int, default=6000, help="games to collect")
+    # Epochs is now an upper bound: training early-stops on val plateau and
+    # saves the best-val checkpoint, so a high cap just gives it room.
+    parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument(
+        "--patience", type=int, default=8, help="early-stop patience (epochs)"
+    )
     parser.add_argument(
         "--dataset",
         default="bc_dataset.npz",
@@ -293,6 +334,8 @@ def main():
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
         device=args.device,
         seed=args.seed,
     )
