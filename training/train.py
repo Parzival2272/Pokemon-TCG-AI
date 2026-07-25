@@ -208,7 +208,7 @@ if __name__ == "__main__":
         model.policy.load_state_dict(params["policy"])
         print(f"Warm-started policy from {bc_init}")
 
-    total_timesteps = 5_000_000
+    total_timesteps = 15_000_000
     win_rate_cb = WinRateCallback()
     snapshot_cb = SnapshotCallback(
         SNAPSHOT_DIR, SNAPSHOT_FREQ, max_snapshots=MAX_SNAPSHOTS, verbose=1
@@ -218,7 +218,8 @@ if __name__ == "__main__":
     model.learn(total_timesteps=total_timesteps, callback=[win_rate_cb, snapshot_cb])
     elapsed = time.perf_counter() - start
 
-    model.save("ppo_starmie_v8")
+    model_name = "ppo_starmie_v12"
+    model.save(model_name)
 
     # ---- End-of-training report -------------------------------------------
     steps_done = model.num_timesteps
@@ -250,4 +251,4 @@ if __name__ == "__main__":
         if g:
             print(f"  {name:<16}: {w / g:6.1%}  ({w:,}/{g:,})")
     print("=" * 60)
-    print("Saved model to ppo_starmie_v7.zip")
+    print(f"Saved model to {model_name}.zip")
