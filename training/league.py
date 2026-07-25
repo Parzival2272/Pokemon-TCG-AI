@@ -95,19 +95,30 @@ class SnapshotOpponentPool:
     policies are cached per worker process; cache entries whose file was
     pruned are dropped. All entries share one `name` so WinRateCallback logs
     a single win_rate/<name> series (expected to hover near 50% as learner
-    and league improve together). Returns [] while the directory is empty --
-    CabtEnv then falls back to pure self-play for that episode, which only
-    happens in the first moments of a fresh run before SnapshotCallback's
-    initial save.
+    and league improve together).
+
+    `fallback` is an ordinary (name, agent_fn, deck) pool used for episodes
+    where no snapshot could be loaded. That window is small but real: SB3
+    resets the envs inside _setup_learn() BEFORE firing on_training_start(),
+    which is where SnapshotCallback writes the first snapshot, so each league
+    worker's very first episode of a run finds an empty directory. Without a
+    fallback CabtEnv treats the empty pool as pure self-play -- exactly the
+    both-sides-live mode the module docstring above explains this class exists
+    to avoid, since those transitions get mis-credited by GAE. It is only
+    ~N_LEAGUE_ENVS episodes per run, but they are wrong rather than merely
+    few, and they also spawn a stray win_rate/selfplay series. Passing the
+    heuristic pool here makes them ordinary heuristic games instead. Leave it
+    None to keep the old self-play fallback.
 
     Picklable before first use (no torch state until a snapshot is actually
     loaded), so it survives the trip to SubprocVecEnv workers.
     """
 
-    def __init__(self, snapshot_dir, deck, name="league"):
+    def __init__(self, snapshot_dir, deck, name="league", fallback=None):
         self.snapshot_dir = snapshot_dir
         self.deck = deck
         self.name = name
+        self.fallback = list(fallback) if fallback else []
         self._agents: dict[str, _SnapshotAgent] = {}
 
     def __call__(self):
@@ -126,4 +137,6 @@ class SnapshotOpponentPool:
                     continue
                 self._agents[path] = agent
             entries.append((self.name, agent, self.deck))
-        return entries
+        # Keyed on `entries`, not `files`, so a directory whose snapshots all
+        # failed to load falls back too rather than going self-play.
+        return entries or self.fallback

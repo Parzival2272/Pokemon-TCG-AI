@@ -8,7 +8,7 @@ from training.obs_vectorizer import (
     obs_to_vector,
     set_vectorizer_deck,
 )
-from training.rewards import compute_reward
+from training.rewards import reward_terms
 import numpy as np
 import gymnasium as gym
 
@@ -240,6 +240,9 @@ class CabtEnv(gym.Env):
             # Intermediate sub-step: the engine has NOT advanced, so the board
             # is unchanged and only the partial selection differs. No reward,
             # not done -- the decision continues on the next step.
+            # Info stays empty: with reward exactly 0.0 there is no breakdown
+            # to report, so RewardTermCallback's per-episode sums are
+            # unaffected by skipping these (it reads info via .get()).
             return (
                 obs_to_vector(self._obs, picked=self._picked),
                 0.0,
@@ -281,12 +284,22 @@ class CabtEnv(gym.Env):
             # flip at game end, so result == that index and the winning move
             # would score -1.)
             me_index = (prev_obs.get("current") or {}).get("yourIndex", 0)
-        reward = compute_reward(prev_obs, obs_dict, done, result, me_index)
+        # reward_terms() is called exactly once per step (it advances turn
+        # state as a side effect) and summed here, so the scalar reward and
+        # the logged breakdown are guaranteed to be the same number.
+        terms = reward_terms(prev_obs, obs_dict, done, result, me_index)
+        reward = sum(terms.values())
 
+        # Per-step reward breakdown for RewardTermCallback. ~19 floats
+        # alongside a 3312-float observation, so the extra pickling cost
+        # across SubprocVecEnv is negligible next to what every step already
+        # ships.
+        info = {"reward_terms": terms}
         # Tag the finished game with the opponent so WinRateCallback can
         # bucket win rate per matchup (Monitor lifts this into info["episode"]
         # via info_keywords=("opponent",)).
-        info = {"opponent": self._opponent_name} if done else {}
+        if done:
+            info["opponent"] = self._opponent_name
 
         self._sync_select_state(obs_dict)
         return obs_to_vector(obs_dict, picked=self._picked), reward, done, False, info

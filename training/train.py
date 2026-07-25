@@ -9,7 +9,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 from training.cabt_env import DECK_PATH, POLICY_NET_ARCH, CabtEnv
-from training.callbacks import SnapshotCallback, WinRateCallback
+from training.callbacks import RewardTermCallback, SnapshotCallback, WinRateCallback
 from training.league import SnapshotOpponentPool
 
 from heuristics.crustle_agent import agent as crustle_agent
@@ -149,11 +149,15 @@ def mask_fn(env):
 
 def make_league_env():
     # The pool is a callable, re-scanned each episode, so snapshots saved
-    # mid-run join the league (empty dir -> pure self-play fallback, only
-    # before the initial snapshot lands). Snapshots pilot the learner's own
-    # deck: a mirror match, which is also what they were trained on.
+    # mid-run join the league. Snapshots pilot the learner's own deck: a
+    # mirror match, which is also what they were trained on. Until the first
+    # snapshot lands (SB3 resets the envs before on_training_start fires, so
+    # this worker's first episode always predates it) the pool falls back to
+    # the heuristics rather than to pure self-play -- see SnapshotOpponentPool.
     env = CabtEnv(
-        opponent_agents=SnapshotOpponentPool(SNAPSHOT_DIR, _load_deck(DECK_PATH))
+        opponent_agents=SnapshotOpponentPool(
+            SNAPSHOT_DIR, _load_deck(DECK_PATH), fallback=OPPONENT_POOL
+        )
     )
     env = ActionMasker(env, mask_fn)
     # info_keywords lifts CabtEnv's per-episode "opponent" tag into
@@ -170,6 +174,15 @@ def make_heuristic_env():
 
 
 if __name__ == "__main__":
+    # Built FIRST, before the envs: its constructor clears SNAPSHOT_DIR so
+    # this run's league is its own, and SubprocVecEnv workers glob that
+    # directory from their very first reset (which SB3 performs before any
+    # callback hook runs). Constructing it later would let those first
+    # episodes draw the previous run's snapshots.
+    snapshot_cb = SnapshotCallback(
+        SNAPSHOT_DIR, SNAPSHOT_FREQ, max_snapshots=MAX_SNAPSHOTS, verbose=1
+    )
+
     env_fns = [make_league_env] * N_LEAGUE_ENVS + [
         make_heuristic_env
     ] * N_HEURISTIC_ENVS
@@ -209,13 +222,14 @@ if __name__ == "__main__":
         print(f"Warm-started policy from {bc_init}")
 
     total_timesteps = 15_000_000
-    win_rate_cb = WinRateCallback()
-    snapshot_cb = SnapshotCallback(
-        SNAPSHOT_DIR, SNAPSHOT_FREQ, max_snapshots=MAX_SNAPSHOTS, verbose=1
-    )
+    win_rate_cb = WinRateCallback()  # snapshot_cb was built above, before the envs
+    reward_term_cb = RewardTermCallback()
 
     start = time.perf_counter()
-    model.learn(total_timesteps=total_timesteps, callback=[win_rate_cb, snapshot_cb])
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[win_rate_cb, reward_term_cb, snapshot_cb],
+    )
     elapsed = time.perf_counter() - start
 
     model_name = "ppo_starmie_v12"
@@ -226,7 +240,9 @@ if __name__ == "__main__":
     avg_fps = steps_done / elapsed if elapsed > 0 else float("nan")
 
     summary = win_rate_cb.summary()
-    total_games = summary.get("overall", (0, 0))[1]
+    # "overall" now covers the heuristic opponents only, so it undercounts the
+    # episodes actually played -- sum the per-opponent entries for the total.
+    total_games = sum(g for name, (_, g) in summary.items() if name != "overall")
 
     print("\n" + "=" * 60)
     print("TRAINING REPORT")
@@ -242,13 +258,16 @@ if __name__ == "__main__":
         print(f"Episodes/hour        : {total_games / elapsed * 3600:,.0f}")
 
     print("\nWin rate (career, cumulative over run):")
-    # Overall first, then per-opponent sorted worst matchup first.
+    # Overall first, then per-opponent sorted worst matchup first. "league"
+    # appears among them but is excluded from overall (see WinRateCallback);
+    # it is a mirror match, so ~50% is the healthy reading, not a matchup score.
     overall = summary.pop("overall", None)
     if overall is not None:
         w, g = overall
-        print(f"  {'overall':<16}: {w / g:6.1%}  ({w:,}/{g:,})" if g else "  overall: n/a")
+        label = "overall (vs heuristics)"
+        print(f"  {label:<22}: {w / g:6.1%}  ({w:,}/{g:,})" if g else f"  {label}: n/a")
     for name, (w, g) in sorted(summary.items(), key=lambda kv: kv[1][0] / kv[1][1] if kv[1][1] else 0):
         if g:
-            print(f"  {name:<16}: {w / g:6.1%}  ({w:,}/{g:,})")
+            print(f"  {name:<22}: {w / g:6.1%}  ({w:,}/{g:,})")
     print("=" * 60)
     print(f"Saved model to {model_name}.zip")
