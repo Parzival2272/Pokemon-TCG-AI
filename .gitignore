@@ -5,3 +5,4 @@ __pycache__/
 heuristics/lucario/vis.json
 heuristics/lucario/*.html
 submission.tar.gz
+/league_snapshots/*

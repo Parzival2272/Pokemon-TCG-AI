@@ -87,7 +87,7 @@ if DEVICE == "cuda" and not torch.cuda.is_available():
 # tiny MlpPolicy -- this profile exists so switching DEVICE="cuda" is a
 # single flag flip once the model is heavy enough to justify it, instead of
 # a re-tune at that point.
-_CPU_PROFILE = dict(reserved_cores=2, batch_size=64, n_epochs=10, policy_kwargs=None)
+_CPU_PROFILE = dict(reserved_cores=2, batch_size=256, n_epochs=4, policy_kwargs=None)
 _GPU_PROFILE = dict(
     reserved_cores=1,
     batch_size=2048,
@@ -182,7 +182,7 @@ if __name__ == "__main__":
         env,
         verbose=1,
         device=DEVICE,
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         n_steps=N_STEPS,  # N_STEPS * N_ENVS ~= TARGET_SAMPLES_PER_UPDATE
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
@@ -218,7 +218,7 @@ if __name__ == "__main__":
     model.learn(total_timesteps=total_timesteps, callback=[win_rate_cb, snapshot_cb])
     elapsed = time.perf_counter() - start
 
-    model.save("ppo_starmie_v2")
+    model.save("ppo_starmie_v8")
 
     # ---- End-of-training report -------------------------------------------
     steps_done = model.num_timesteps
