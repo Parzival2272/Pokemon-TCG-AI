@@ -38,7 +38,7 @@ import torch as th
 import torch.nn.functional as F
 
 from heuristics.starmie_agent import agent as starmie_agent
-from training.cabt_env import CabtEnv, _sanitize_selection
+from training.cabt_env import POLICY_NET_ARCH, CabtEnv, _sanitize_selection
 
 # Matches train.py's PPO gamma so the value head is fit to the same return
 # definition PPO will bootstrap against.
@@ -166,8 +166,16 @@ def behavior_clone(
 
     # Built only for its spaces + policy; never stepped or reset here.
     env = ActionMasker(CabtEnv(), lambda e: e.action_masks())
+    # net_arch MUST match train.py's PPO model: BC_INIT warm-starts by a strict
+    # load_state_dict, so both read the same POLICY_NET_ARCH constant.
     model = MaskablePPO(
-        "MlpPolicy", env, device=device, learning_rate=lr, gamma=GAMMA, seed=seed
+        "MlpPolicy",
+        env,
+        device=device,
+        learning_rate=lr,
+        gamma=GAMMA,
+        seed=seed,
+        policy_kwargs=dict(net_arch=list(POLICY_NET_ARCH)),
     )
     policy = model.policy
 
@@ -195,26 +203,32 @@ def behavior_clone(
 
     for epoch in range(1, epochs + 1):
         perm = train_idx[rng.permutation(len(train_idx))]
-        total_loss = 0.0
+        # Track the imitation (policy NLL) and value-fit (MSE) terms
+        # separately: the total loss can't go near 0 because the value head is
+        # regressing noisy discounted returns, so only the policy term reflects
+        # imitation quality -- and even that has a floor set by observation
+        # aliasing and the expert's arbitrary score tie-breaking.
+        total_loss = total_pg = total_vf = 0.0
         n_batches = 0
         for i in range(0, len(perm), batch_size):
             idx = perm[i : i + batch_size]
             values, log_prob, entropy = policy.evaluate_actions(
                 obs_t[idx], act_t[idx], action_masks=mask_t[idx]
             )
-            loss = (
-                -log_prob.mean()
-                + vf_coef * F.mse_loss(values.flatten(), ret_t[idx])
-                - ent_coef * entropy.mean()
-            )
+            pg_loss = -log_prob.mean()
+            vf_loss = F.mse_loss(values.flatten(), ret_t[idx])
+            loss = pg_loss + vf_coef * vf_loss - ent_coef * entropy.mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+            total_pg += pg_loss.item()
+            total_vf += vf_loss.item()
             n_batches += 1
         val_acc = _accuracy(policy, obs_t[val_idx], mask_t[val_idx], act_t[val_idx])
         print(
-            f"  epoch {epoch:2d}: loss {total_loss / n_batches:.4f}, "
+            f"  epoch {epoch:2d}: loss {total_loss / n_batches:.4f} "
+            f"(policy {total_pg / n_batches:.4f}, value {total_vf / n_batches:.4f}), "
             f"val accuracy {val_acc:.1%}"
         )
 
@@ -233,7 +247,9 @@ def main():
     # Collection runs ~30 games/s single-process, so 2000 episodes (~80k
     # samples) is well under two minutes.
     parser.add_argument("--episodes", type=int, default=2000, help="games to collect")
-    parser.add_argument("--epochs", type=int, default=20)
+    # The loss/accuracy were still improving monotonically at epoch 20 in the
+    # original run, so it was undertrained; give it room to converge.
+    parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument(
@@ -246,11 +262,22 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
+    data = None
     if os.path.exists(args.dataset):
         print(f"Loading cached dataset {args.dataset}")
         with np.load(args.dataset) as npz:
             data = {k: npz[k] for k in npz.files}
-    else:
+        # The observation layout changed (obs_vectorizer.py), so a cache from an
+        # older width would feed wrong-sized vectors into the new policy net.
+        # Detect the mismatch and re-collect rather than crash cryptically.
+        if data["obs"].shape[1] != CabtEnv.OBS_SIZE:
+            print(
+                f"  cached obs width {data['obs'].shape[1]} != current OBS_SIZE "
+                f"{CabtEnv.OBS_SIZE} (vectorizer changed); re-collecting."
+            )
+            data = None
+
+    if data is None:
         print(f"Collecting {args.episodes} expert episodes...")
         start = time.perf_counter()
         data = collect_dataset(args.episodes, seed=args.seed)

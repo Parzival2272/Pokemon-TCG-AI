@@ -8,7 +8,7 @@ from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from training.cabt_env import DECK_PATH, CabtEnv
+from training.cabt_env import DECK_PATH, POLICY_NET_ARCH, CabtEnv
 from training.callbacks import SnapshotCallback, WinRateCallback
 from training.league import SnapshotOpponentPool
 
@@ -137,7 +137,10 @@ N_STEPS = max(TARGET_SAMPLES_PER_UPDATE // N_ENVS, 1)
 # buffer per update -- both overridable via env vars regardless of profile.
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", _profile["batch_size"]))
 N_EPOCHS = int(os.environ.get("N_EPOCHS", _profile["n_epochs"]))
-POLICY_KWARGS = _profile["policy_kwargs"]
+# Warm-starting from bc.py requires the PPO model to have the SAME architecture
+# the BC model used (load_state_dict is strict), so default both profiles to
+# the shared POLICY_NET_ARCH unless a profile explicitly pins its own kwargs.
+POLICY_KWARGS = _profile["policy_kwargs"] or dict(net_arch=list(POLICY_NET_ARCH))
 
 
 def mask_fn(env):

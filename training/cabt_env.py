@@ -14,6 +14,15 @@ import gymnasium as gym
 
 DECK_PATH = "deck.csv"
 
+# Shared policy/value network architecture. bc.py builds a MaskablePPO with
+# this net_arch, and train.py warm-starts (load_state_dict, which is strict)
+# into a model that must have the SAME arch -- so both import this one constant
+# to stay in lock-step. The enriched observation (see obs_vectorizer.py) is
+# wider and carries the card-semantic features the heuristic branches on, so a
+# 64x64 net is underpowered; 256x256 gives it room without materially slowing
+# CPU training (vectorization, not the forward pass, is the hot path here).
+POLICY_NET_ARCH = [256, 256]
+
 
 def _load_deck():
     """Load a 60-card deck (one card ID per line) from DECK_PATH."""

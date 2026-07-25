@@ -9,6 +9,12 @@ MAX_DECK_SLOTS = 60
 # simple per-card cap would suggest, so this needs real headroom.
 MAX_OPTIONS = 128
 
+# Per-unique-card deck-count belief: how many copies of each of the learner
+# deck's distinct card ids remain unseen (deck + prizes = decklist minus
+# visible zones). The heuristics gate most of their searches on these counts,
+# so the policy gets them too. A 60-card deck has well under this many uniques.
+MAX_UNIQUE_CARDS = 30
+
 # All card-id features (Pokemon ids, hand ids, attack ids, ...) share one
 # normaliser so the network sees a consistent scale. Max observed id is well
 # under this (trainers ~1260), keeping features in [0, 1].
@@ -19,11 +25,23 @@ CARD_ID_NORM = 2000.0
 POKE_FEATURES = 6
 # Energy-type histogram length (EnergyType enum: COLORLESS..TEAM_ROCKET = 0..11).
 N_ENERGY_TYPES = 12
-# Per-option features: option type, the card the option acts on, attack id, and
-# a flag for whether this option is already picked in the current (possibly
-# multi-pick) selection -- the autoregressive action space picks one option per
-# step, so the policy needs to see what it has selected so far this decision.
-OPTION_FEATURES = 4
+# Per-option base features: option type, the card the option acts on, attack
+# id, and a flag for whether this option is already picked in the current
+# (possibly multi-pick) selection -- the autoregressive action space picks one
+# option per step, so the policy needs to see what it has selected so far.
+OPT_BASE_FEATURES = 4
+# Semantic attributes of the card an option acts on, resolved from the engine's
+# card database: the same facts the heuristics branch on (card type, evolution
+# stage, ex/mega, Water weakness, prize value, printed HP). Without these the
+# policy would have to reconstruct card identity from one normalized id scalar,
+# where numerically adjacent ids are unrelated cards.
+OPT_CARD_FEATURES = 14
+# The in-play Pokemon an ATTACH/EVOLVE/DISCARD/ABILITY option targets on our
+# board (its inPlayArea/inPlayIndex): present-flag, id, current hp, max hp,
+# energy count. Two "attach Water" options onto different Pokemon are scored
+# very differently by the expert but were otherwise identical in the vector.
+OPT_TARGET_FEATURES = 5
+OPTION_FEATURES = OPT_BASE_FEATURES + OPT_CARD_FEATURES + OPT_TARGET_FEATURES
 # Special conditions per player's active: poisoned/burned/asleep/paralyzed/confused.
 COND_FEATURES = 5
 # Turn / resource / count scalars (see _state_block). The last two are
@@ -44,17 +62,72 @@ VECTOR_SIZE = (
     + STATE_FEATURES  # turn / resource / selection-count scalars
     + LOG_FEATURES  # recent damage / last attacks from the event log
     + 4  # your_prizes, opp_prizes, stadium_id, context
-    + OPTION_FEATURES * MAX_OPTIONS  # per-option [type, card id, attack id]
+    + MAX_UNIQUE_CARDS  # per-unique-card unseen-copies belief
+    + OPTION_FEATURES * MAX_OPTIONS  # per-option base + card-semantic + target
 )
 
 # Deck order
 VECTORIZER_DECK = [0] * MAX_DECK_SLOTS
+# The deck's distinct card ids in a stable (sorted) order, used to lay out the
+# per-unique-card deck-count belief block (see deck_count_vec).
+VECTORIZER_DECK_UNIQUE: list[int] = []
 
 
 def set_vectorizer_deck(deck: list[int]) -> None:
     """Set the 60 card deck order used by the deck slot flags."""
-    global VECTORIZER_DECK
+    global VECTORIZER_DECK, VECTORIZER_DECK_UNIQUE
     VECTORIZER_DECK = list(deck)
+    VECTORIZER_DECK_UNIQUE = sorted({int(c) for c in deck if c})[:MAX_UNIQUE_CARDS]
+
+
+# --- Card-database semantic features ----------------------------------------
+# The heuristics decide by card *identity and attributes* (evolution stage,
+# ex/mega, Weakness, prize value, card type), looked up from the engine's card
+# database. The policy only sees a normalized id, so hand it those attributes
+# directly. Precomputed once per card id -- vectorization is the training
+# step's hot path, so a live DB lookup per option would be too costly.
+try:
+    from ptcg.api import all_card_data, CardType
+
+    _CARD_DB = {c.cardId: c for c in all_card_data()}
+except Exception:  # DLL / card data unavailable -> features degrade to zeros
+    CardType = None
+    _CARD_DB = {}
+
+_WATER = 3  # EnergyType.WATER
+
+
+def _card_semantic_feats(data) -> list[float]:
+    """The OPT_CARD_FEATURES semantic attributes of one card (zeros if unknown)."""
+    if data is None or CardType is None:
+        return [0.0] * OPT_CARD_FEATURES
+    ct = getattr(data, "cardType", None)
+    weak = getattr(data, "weakness", None)
+    weak_val = getattr(weak, "value", weak)
+    ex = bool(getattr(data, "ex", False))
+    mega = bool(getattr(data, "megaEx", False))
+    prize = 3 if mega else (2 if ex else 1)
+    return [
+        1.0 if ct == CardType.POKEMON else 0.0,
+        1.0 if ct == CardType.ITEM else 0.0,
+        1.0 if ct == CardType.SUPPORTER else 0.0,
+        1.0 if ct == CardType.STADIUM else 0.0,
+        1.0 if ct == CardType.TOOL else 0.0,
+        1.0 if ct in (CardType.BASIC_ENERGY, CardType.SPECIAL_ENERGY) else 0.0,
+        1.0 if getattr(data, "basic", False) else 0.0,
+        1.0 if getattr(data, "stage1", False) else 0.0,
+        1.0 if getattr(data, "stage2", False) else 0.0,
+        1.0 if ex else 0.0,
+        1.0 if mega else 0.0,
+        1.0 if weak_val == _WATER else 0.0,
+        prize / 3.0,
+        (getattr(data, "hp", 0) or 0) / 480,
+    ]
+
+
+# id -> precomputed semantic feature list; unknown ids fall back to zeros.
+_CARD_FEATS = {cid: _card_semantic_feats(d) for cid, d in _CARD_DB.items()}
+_ZERO_CARD_FEATS = [0.0] * OPT_CARD_FEATURES
 
 
 def visible_owned_card_ids(current: dict, your_index: int) -> list[int]:
@@ -175,6 +248,26 @@ def prize_flag_vec(obs_dict: dict) -> list[float]:
     return slot_flags
 
 
+def deck_count_vec(obs_dict: dict) -> list[float]:
+    """Per-unique-card belief of how many copies of each of the learner deck's
+    distinct card ids are still unseen (deck + prizes) -- the decklist count
+    minus what's visible on our side. Ordered by VECTORIZER_DECK_UNIQUE and
+    padded to MAX_UNIQUE_CARDS. Mirrors the heuristics' deck_counts(), which
+    gate most searches on exactly these remaining counts."""
+    current = obs_dict.get("current") or {}
+    your_index = int(current.get("yourIndex", 0) or 0)
+    if not VECTORIZER_DECK_UNIQUE:
+        return [0.0] * MAX_UNIQUE_CARDS
+    deck_total = Counter(VECTORIZER_DECK)
+    visible = Counter(visible_owned_card_ids(current, your_index))
+    out = [
+        max(0, deck_total.get(cid, 0) - visible.get(cid, 0)) / 5.0
+        for cid in VECTORIZER_DECK_UNIQUE
+    ]
+    out += [0.0] * (MAX_UNIQUE_CARDS - len(out))
+    return out
+
+
 # --- Per-option card resolution ---------------------------------------------
 # The engine (ApiJson.h SelectOptionJson) encodes each option's card by
 # reference, not by id, so to feed the network "which card does this option
@@ -230,6 +323,30 @@ def _option_card_id(obs_dict: dict, current: dict, opt: dict, your_index: int) -
         return 0
     card = lst[idx]
     return (card.get("id") or 0) if card else 0
+
+
+def _option_target_feats(obs_dict, current, opt, your_index) -> list[float]:
+    """Features of the in-play Pokemon an option targets. ATTACH/EVOLVE/
+    DISCARD/ABILITY carry inPlayArea/inPlayIndex pointing at one of our own
+    board Pokemon; resolve it the way the heuristics' option_target does.
+    Zeros when the option references no board target (searches, attacks, ...)."""
+    area = opt.get("inPlayArea")
+    idx = opt.get("inPlayIndex")
+    if area is None or idx is None:
+        return [0.0] * OPT_TARGET_FEATURES
+    lst = _zone_list(obs_dict, current, area, your_index)
+    if not (0 <= idx < len(lst)):
+        return [0.0] * OPT_TARGET_FEATURES
+    mon = lst[idx]
+    if not mon:
+        return [0.0] * OPT_TARGET_FEATURES
+    return [
+        1.0,
+        (mon.get("id") or 0) / CARD_ID_NORM,
+        (mon.get("hp") or 0) / 480,
+        (mon.get("maxHp") or 0) / 480,
+        len(mon.get("energies") or []) / 20,
+    ]
 
 
 def _poke_vec(mon) -> list[float]:
@@ -392,15 +509,19 @@ def obs_to_vector(obs_dict: dict, picked=()) -> np.ndarray:
     # Select context (what kind of decision is this?)
     context = (select.get("context") or 0) / 50
 
-    # Per-option block: type, the card the option acts on, attack id, and a
-    # flag for whether this option is already picked this decision.
+    # Per-option block: base features (type, acted-on card id, attack id,
+    # picked flag), then the acted-on card's semantic attributes, then the
+    # in-play Pokemon the option targets.
     options = select.get("option") or []
     opt_block: list[float] = []
     for idx, o in enumerate(options[:MAX_OPTIONS]):
+        cid = _option_card_id(obs_dict, current, o, your_index)
         opt_block.append((o.get("type") or 0) / 16)
-        opt_block.append(_option_card_id(obs_dict, current, o, your_index) / CARD_ID_NORM)
+        opt_block.append(cid / CARD_ID_NORM)
         opt_block.append((o.get("attackId") or 0) / CARD_ID_NORM)
         opt_block.append(1.0 if idx in picked_set else 0.0)
+        opt_block.extend(_CARD_FEATS.get(cid, _ZERO_CARD_FEATS))
+        opt_block.extend(_option_target_feats(obs_dict, current, o, your_index))
     opt_block += [0.0] * (OPTION_FEATURES * MAX_OPTIONS - len(opt_block))
 
     vec = (
@@ -419,6 +540,7 @@ def obs_to_vector(obs_dict: dict, picked=()) -> np.ndarray:
         )  # STATE_FEATURES
         + _log_block(obs_dict.get("logs"), your_index)  # LOG_FEATURES
         + [your_prizes, opp_prizes, stadium_id, context]  # 4
+        + deck_count_vec(obs_dict)  # MAX_UNIQUE_CARDS
         + opt_block  # OPTION_FEATURES * MAX_OPTIONS
     )
     assert len(vec) == VECTOR_SIZE, (len(vec), VECTOR_SIZE)
