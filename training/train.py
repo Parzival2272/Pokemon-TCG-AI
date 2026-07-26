@@ -142,6 +142,28 @@ N_EPOCHS = int(os.environ.get("N_EPOCHS", _profile["n_epochs"]))
 # the shared POLICY_NET_ARCH unless a profile explicitly pins its own kwargs.
 POLICY_KWARGS = _profile["policy_kwargs"] or dict(net_arch=list(POLICY_NET_ARCH))
 
+# Learning-rate schedule: start high so early updates move the policy off its
+# random/BC init quickly, then decay to a floor so late training refines
+# instead of thrashing (a constant 1e-4 does neither well over 30M steps).
+# Decays linearly from LR_START to LR_END over the first LR_DECAY_FRAC of
+# training, then holds LR_END flat for the remainder -- the "bottoming out".
+LR_START = float(os.environ.get("LR_START", 3e-4))
+LR_END = float(os.environ.get("LR_END", 3e-5))
+LR_DECAY_FRAC = float(os.environ.get("LR_DECAY_FRAC", 0.8))
+
+
+def linear_decay_to_floor(start: float, end: float, decay_frac: float):
+    """SB3 schedule: takes progress_remaining (1.0 at start -> 0.0 at end)."""
+
+    def schedule(progress_remaining: float) -> float:
+        progress = 1.0 - progress_remaining  # 0.0 -> 1.0 as training advances
+        if decay_frac <= 0:
+            return end
+        frac = min(progress / decay_frac, 1.0)
+        return start + frac * (end - start)
+
+    return schedule
+
 
 def mask_fn(env):
     return env.action_masks()
@@ -189,13 +211,17 @@ if __name__ == "__main__":
     env = SubprocVecEnv(env_fns)
 
     print(f"Training on device: {DEVICE}")
+    print(
+        f"LR schedule: {LR_START:.1e} -> {LR_END:.1e} over the first "
+        f"{LR_DECAY_FRAC:.0%} of training, then flat"
+    )
 
     model = MaskablePPO(
         "MlpPolicy",
         env,
         verbose=1,
         device=DEVICE,
-        learning_rate=1e-4,
+        learning_rate=linear_decay_to_floor(LR_START, LR_END, LR_DECAY_FRAC),
         n_steps=N_STEPS,  # N_STEPS * N_ENVS ~= TARGET_SAMPLES_PER_UPDATE
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
@@ -232,7 +258,7 @@ if __name__ == "__main__":
     )
     elapsed = time.perf_counter() - start
 
-    model_name = "ppo_starmie_v13"
+    model_name = "ppo_starmie_v14"
     model.save(model_name)
 
     # ---- End-of-training report -------------------------------------------
@@ -249,6 +275,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Device               : {DEVICE}")
     print(f"Parallel envs        : {N_ENVS}")
+    print(
+        f"Learning rate        : {LR_START:.1e} -> {LR_END:.1e} "
+        f"(linear over first {LR_DECAY_FRAC:.0%}, then flat)"
+    )
     print(f"Timesteps            : {steps_done:,} / {total_timesteps:,}")
     print(f"Wall-clock time      : {timedelta(seconds=round(elapsed))} ({elapsed:.1f}s)")
     print(f"Average FPS          : {avg_fps:,.0f} steps/s")
