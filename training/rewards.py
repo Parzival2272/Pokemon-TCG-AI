@@ -551,8 +551,44 @@ def _stadium_identity(obs_dict):
     return (s.get("id"), s.get("playerIndex")) if s else None
 
 
-def compute_reward(prev_obs, cur_obs, done, result, me_index):
-    """Reward from the acting player's perspective.
+# Every term reward_terms() reports, in a fixed order. Declared here so the
+# TensorBoard logger (training/callbacks.py RewardTermCallback) can write a
+# stable, COMPLETE key set every rollout: a term whose schema assumptions are
+# wrong then shows up as a flat 0.0 series instead of silently never
+# appearing. Several terms in this file spent many training runs contributing
+# nothing for exactly that reason, with no signal that anything was wrong.
+REWARD_TERMS = (
+    "terminal",
+    "prize_mine",
+    "prize_opp",
+    "evolve",
+    "energy_attach",
+    "damage",
+    "draw",
+    "wally_heal",
+    "ignition_waste",
+    "hammer",
+    "budew_item",
+    "boss",
+    "bench",
+    "evolve_matchup",
+    "no_attack",
+    "froslass_attack",
+    "deck_save",
+    "supporter",
+    "stadium",
+)
+
+
+def reward_terms(prev_obs, cur_obs, done, result, me_index):
+    """Per-term breakdown of the reward, keyed by REWARD_TERMS.
+
+    Each value is that term's SIGNED contribution, so penalties are negative
+    and the total reward is just the sum -- compute_reward() is defined as
+    exactly that sum, so the two can never drift apart.
+
+    Call at most ONCE per step: _no_attack_turn_penalty advances per-player
+    turn state as a side effect, so a second call would double-count turns.
 
     Args:
         prev_obs: the observation the action was chosen from (non-terminal).
@@ -563,15 +599,20 @@ def compute_reward(prev_obs, cur_obs, done, result, me_index):
             learner vs a heuristic opponent, or the mover in self-play.
 
     Returns:
-        float: +1/-1 on a terminal step, otherwise the prize-differential
-        shaping term (with a multi-prize bonus) plus the evolve,
-        energy-attach, damage, draw, Wally-heal, Ignition-waste, Crushing
-        Hammer, Budew/Item, Boss's Orders, bench-size, matchup-evolution,
-        no-attack-turn, Resentful-Refrain-timing, Absolute-Snow-into-tank,
-        deck-out-risk/Run-Away-Draw, Supporter-play, and Stadium terms below.
+        dict[str, float]: every REWARD_TERMS key, zero-filled. A terminal step
+        is +1/-1 in "terminal" with all shaping zero; every other step carries
+        the prize-differential term (with a multi-prize bonus) plus the
+        evolve, energy-attach, damage, draw, Wally-heal, Ignition-waste,
+        Crushing Hammer, Budew/Item, Boss's Orders, bench-size,
+        matchup-evolution, no-attack-turn, Resentful-Refrain-timing /
+        Absolute-Snow-into-tank, deck-out-risk/Run-Away-Draw, Supporter-play
+        and Stadium terms below.
     """
+    terms = dict.fromkeys(REWARD_TERMS, 0.0)
+
     if done:
-        return 1.0 if result == me_index else -1.0
+        terms["terminal"] = 1.0 if result == me_index else -1.0
+        return terms
 
     opp_index = 1 - me_index
     my_took = max(
@@ -665,24 +706,39 @@ def compute_reward(prev_obs, cur_obs, done, result, me_index):
 
     no_attack_penalty = _no_attack_turn_penalty(prev_obs, cur_obs, me_index)
 
-    return (
-        my_prize_reward
-        - opp_prize_reward
-        + evolve_reward
-        + energy_reward
-        + damage_reward
-        + draw_reward
-        + wally_reward
-        - ignition_penalty
-        + hammer_reward
-        + budew_reward
-        + boss_reward
-        - bench_penalty
-        - evolve_matchup_penalty
-        - no_attack_penalty
-        - froslass_attack_penalty
-        + froslass_attack_bonus
-        + deck_save_reward
-        + supporter_reward
-        + stadium_reward
-    )
+    # Signed contributions -- penalties negated here so the total is a plain
+    # sum and each logged series reads with its true sign.
+    terms["prize_mine"] = my_prize_reward
+    terms["prize_opp"] = -opp_prize_reward
+    terms["evolve"] = evolve_reward
+    terms["energy_attach"] = energy_reward
+    terms["damage"] = damage_reward
+    terms["draw"] = draw_reward
+    terms["wally_heal"] = wally_reward
+    terms["ignition_waste"] = -ignition_penalty
+    terms["hammer"] = hammer_reward
+    terms["budew_item"] = budew_reward
+    terms["boss"] = boss_reward
+    terms["bench"] = -bench_penalty
+    terms["evolve_matchup"] = -evolve_matchup_penalty
+    terms["no_attack"] = -no_attack_penalty
+    # The Resentful Refrain penalty and the Absolute Snow bonus are mutually
+    # exclusive (each is 0 unless that attack was the one used), so they share
+    # one series rather than splitting into two mostly-empty ones.
+    terms["froslass_attack"] = froslass_attack_bonus - froslass_attack_penalty
+    terms["deck_save"] = deck_save_reward
+    terms["supporter"] = supporter_reward
+    terms["stadium"] = stadium_reward
+    return terms
+
+
+def compute_reward(prev_obs, cur_obs, done, result, me_index):
+    """Total reward from the acting player's perspective -- the sum of
+    reward_terms() (see it for the arguments and the term list).
+
+    Kept as the single-value entry point for callers that don't need the
+    breakdown. Callers that DO want both (CabtEnv, so it can ship the terms
+    out for TensorBoard) should call reward_terms() once and sum it rather
+    than calling both, since reward_terms() is not side-effect free.
+    """
+    return sum(reward_terms(prev_obs, cur_obs, done, result, me_index).values())

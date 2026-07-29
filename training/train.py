@@ -119,6 +119,8 @@ N_ENVS = int(
 SNAPSHOT_DIR = "./league_snapshots"
 SNAPSHOT_FREQ = 100_000
 MAX_SNAPSHOTS = 5
+TENSORBOARD_LOG_DIR = os.path.abspath("./ppo_cabt_logs")
+os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
 
 # Split workers between league self-play (vs frozen snapshots, see above) and
 # a heuristic opponent (directly optimizes for beating the known baselines --
@@ -147,7 +149,7 @@ POLICY_KWARGS = _profile["policy_kwargs"] or dict(net_arch=list(POLICY_NET_ARCH)
 # instead of thrashing (a constant 1e-4 does neither well over 30M steps).
 # Decays linearly from LR_START to LR_END over the first LR_DECAY_FRAC of
 # training, then holds LR_END flat for the remainder -- the "bottoming out".
-LR_START = float(os.environ.get("LR_START", 3e-4))
+LR_START = float(os.environ.get("LR_START", 1e-4))
 LR_END = float(os.environ.get("LR_END", 3e-5))
 LR_DECAY_FRAC = float(os.environ.get("LR_DECAY_FRAC", 0.8))
 
@@ -230,7 +232,7 @@ if __name__ == "__main__":
         # SB3's default is 0.0; a small entropy bonus keeps the policy
         # exploring instead of collapsing onto one action pattern early.
         ent_coef=0.01,
-        tensorboard_log="./ppo_cabt_logs/",
+        tensorboard_log=TENSORBOARD_LOG_DIR,
     )
 
     # Warm start: BC_INIT=<path.zip> copies the policy weights (actor AND
@@ -247,7 +249,7 @@ if __name__ == "__main__":
         model.policy.load_state_dict(params["policy"])
         print(f"Warm-started policy from {bc_init}")
 
-    total_timesteps = 10_000_000
+    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 5_000_000))
     win_rate_cb = WinRateCallback()  # snapshot_cb was built above, before the envs
     reward_term_cb = RewardTermCallback()
 
@@ -258,7 +260,7 @@ if __name__ == "__main__":
     )
     elapsed = time.perf_counter() - start
 
-    model_name = "ppo_starmie_v14"
+    model_name = "ppo_starmie_v15"
     model.save(model_name)
 
     # ---- End-of-training report -------------------------------------------
