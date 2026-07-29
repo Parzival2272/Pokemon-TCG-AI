@@ -214,18 +214,9 @@ def _prizes_remaining(obs_dict, player_index):
 def _evolve_count(obs_dict, player_index):
     """Count Evolve events attributed to player_index since the previous decision.
 
-    NOTE: unlike the prize mechanic above, this is NOT verified against a live
-    observation -- I inferred the shape from strings in the compiled engine
-    (kaggle_environments' cabt/cg/libcg.so is a Linux binary I can't load or
-    run here to confirm). It assumes obs_dict["logs"] is a list of event dicts
-    including entries like {"type": "Evolve", "playerIndex": <int>, ...},
-    since "Evolve" appears among log-type-looking constants (alongside
-    "Retreat"/"Ability"/"Discard"/"Attach") and "playerIndex" appears among
-    per-event target fields in the binary's string table. Please confirm the
-    real field names against a printed obs["logs"] from an actual game (e.g.
-    trigger an evolution and inspect cur_obs["logs"]) and adjust this function
-    if they differ -- as written it fails safe (returns 0, no crash) rather
-    than raising if the schema doesn't match.
+    Verified against real obs["logs"] dumps (vis.json): Evolve entries have
+    fields {type, playerIndex, cardId, cardIdTarget, serial, serialTarget},
+    matching this function's assumption exactly.
     """
     count = 0
     for entry in obs_dict.get("logs") or []:
@@ -241,17 +232,14 @@ def _evolve_count(obs_dict, player_index):
 def _energy_attach_count(obs_dict, player_index):
     """Count energy-Attach events by player_index since the previous decision.
 
-    Same caveat as _evolve_count: inferred from the compiled engine's string
-    table, not verified against a live observation. "Attach" appears as a
-    log-type constant alongside "Evolve"/"Ability"/"Discard"/"Retreat", and
-    the string table separately lists both "energyIndex" and "toolIndex" as
-    per-event fields -- consistent with a single "Attach" type covering both
-    energy and tool attachment, disambiguated by which index field is set.
-    This only counts entries that look like an energy attach (energyIndex
-    present). Confirm against a real obs["logs"] and adjust if tool attaches
-    also set energyIndex, or if energy attaches turn out to use a different
-    type/field; as written it fails safe (returns 0) rather than raising if
-    the schema doesn't match.
+    Verified against real obs["logs"] dumps (vis.json): Attach entries have
+    fields {type, playerIndex, cardId, serial, cardIdTarget, serialTarget} --
+    there is no separate energyIndex/toolIndex field, and tool attaches (e.g.
+    Lucky Helmet) use the exact same shape as energy attaches. The only way
+    to tell them apart is the attached card's own type, so this checks
+    _is_energy_card(cardId) instead. Needs CARD_DB to distinguish energy from
+    tool; contributes 0 (fails safe) if CARD_DB is unavailable, same as the
+    other CARD_DB-dependent helpers below.
     """
     count = 0
     for entry in obs_dict.get("logs") or []:
@@ -259,7 +247,7 @@ def _energy_attach_count(obs_dict, player_index):
             isinstance(entry, dict)
             and entry.get("type") == "Attach"
             and entry.get("playerIndex") == player_index
-            and entry.get("energyIndex") is not None
+            and _is_energy_card(entry.get("cardId"))
         ):
             count += 1
     return count
@@ -269,16 +257,16 @@ def _damage_dealt(obs_dict, target_player_index):
     """Sum HP lost by target_player_index's Pokemon (active + bench) since the
     previous decision, from HpChange log entries.
 
-    Same caveat as the other _*_count helpers: inferred from the compiled
-    engine's string table, not verified against a live observation. Assumes
-    obs_dict["logs"] entries look like {"type": "HpChange",
-    "playerIndex": <whose Pokemon changed>, "value": <magnitude>,
-    "isRecover": <bool>, ...}, since "HpChange", "value", and "isRecover" all
-    appear together in the string table. Deliberately doesn't filter by
-    inPlayArea so bench damage (splash/spread attacks) counts same as active
-    damage. Excludes entries where isRecover is true (healing). Confirm the
-    field names/signs against a real obs["logs"] and adjust if they differ;
-    fails safe (contributes 0) rather than raising on a schema mismatch.
+    Verified against real obs["logs"] dumps (vis.json) by tracing a Pokemon's
+    "hp" field across consecutive states against its HpChange entries: fields
+    are {"type": "HpChange", "playerIndex": <whose Pokemon changed>, "cardId",
+    "serial", "value": <signed HP delta>, "putDamageCounter": <bool>} -- there
+    is no separate isRecover field. "value" is the exact signed delta applied
+    to hp (negative for damage, positive for healing); putDamageCounter marks
+    whether the engine applied this particular delta as a 10-HP counter step
+    vs a direct HP set and doesn't affect which entries count as damage.
+    Deliberately doesn't filter by inPlayArea so bench damage (splash/spread
+    attacks) counts same as active damage.
     """
     total = 0
     for entry in obs_dict.get("logs") or []:
@@ -286,12 +274,11 @@ def _damage_dealt(obs_dict, target_player_index):
             isinstance(entry, dict)
             and entry.get("type") == "HpChange"
             and entry.get("playerIndex") == target_player_index
-            and not entry.get("isRecover")
         ):
             continue
         value = entry.get("value")
-        if isinstance(value, (int, float)) and value > 0:
-            total += value
+        if isinstance(value, (int, float)) and value < 0:
+            total += -value
     return total
 
 
@@ -381,12 +368,12 @@ def _prize_value_by_id(card_id):
 
 def _draw_count(obs_dict, player_index):
     """Cards drawn by player_index since the previous decision, from Draw log
-    entries. NOT verified against a live observation (same caveat tier as
-    _evolve_count/_energy_attach_count above) -- "Draw" is a guess at the log
-    type name, unconfirmed. If a single Draw entry represents multiple cards
-    (e.g. Run Away Draw's "draw 3"), a "count"/"amount" field is summed if
-    present, else each entry counts as 1 card. Fails safe (0) on a schema
-    mismatch rather than raising.
+    entries. Verified against real obs["logs"] dumps (vis.json): Draw entries
+    have fields {type, playerIndex, cardId, serial} -- one entry per card
+    drawn, with no count/amount field, so multi-card draws (e.g. Run Away
+    Draw's "draw 3") show up as multiple entries. The count/amount fallback
+    below is kept in case some draw effect ever emits a batched entry, but
+    every entry observed so far is single-card.
     """
     total = 0
     for entry in obs_dict.get("logs") or []:
@@ -400,13 +387,13 @@ def _draw_count(obs_dict, player_index):
 
 def _heal_dealt(obs_dict, player_index):
     """HP healed on player_index's own Pokemon since the previous decision --
-    the mirror image of _damage_dealt's excluded isRecover branch, same
-    schema caveats apply."""
+    the mirror image of _damage_dealt's negative-value branch (see there for
+    the vis.json verification of the HpChange schema: positive "value" is a
+    heal, there is no isRecover field)."""
     total = 0
     for entry in obs_dict.get("logs") or []:
         if not (isinstance(entry, dict) and entry.get("type") == "HpChange"
-                and entry.get("playerIndex") == player_index
-                and entry.get("isRecover")):
+                and entry.get("playerIndex") == player_index):
             continue
         value = entry.get("value")
         if isinstance(value, (int, float)) and value > 0:
@@ -564,44 +551,8 @@ def _stadium_identity(obs_dict):
     return (s.get("id"), s.get("playerIndex")) if s else None
 
 
-# Every term reward_terms() reports, in a fixed order. Declared here so the
-# TensorBoard logger (training/callbacks.py RewardTermCallback) can write a
-# stable, COMPLETE key set every rollout: a term whose schema assumptions are
-# wrong then shows up as a flat 0.0 series instead of silently never
-# appearing. Several terms in this file spent many training runs contributing
-# nothing for exactly that reason, with no signal that anything was wrong.
-REWARD_TERMS = (
-    "terminal",
-    "prize_mine",
-    "prize_opp",
-    "evolve",
-    "energy_attach",
-    "damage",
-    "draw",
-    "wally_heal",
-    "ignition_waste",
-    "hammer",
-    "budew_item",
-    "boss",
-    "bench",
-    "evolve_matchup",
-    "no_attack",
-    "froslass_attack",
-    "deck_save",
-    "supporter",
-    "stadium",
-)
-
-
-def reward_terms(prev_obs, cur_obs, done, result, me_index):
-    """Per-term breakdown of the reward, keyed by REWARD_TERMS.
-
-    Each value is that term's SIGNED contribution, so penalties are negative
-    and the total reward is just the sum -- compute_reward() is defined as
-    exactly that sum, so the two can never drift apart.
-
-    Call at most ONCE per step: _no_attack_turn_penalty advances per-player
-    turn state as a side effect, so a second call would double-count turns.
+def compute_reward(prev_obs, cur_obs, done, result, me_index):
+    """Reward from the acting player's perspective.
 
     Args:
         prev_obs: the observation the action was chosen from (non-terminal).
@@ -612,20 +563,15 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
             learner vs a heuristic opponent, or the mover in self-play.
 
     Returns:
-        dict[str, float]: every REWARD_TERMS key, zero-filled. A terminal step
-        is +1/-1 in "terminal" with all shaping zero; every other step carries
-        the prize-differential term (with a multi-prize bonus) plus the
-        evolve, energy-attach, damage, draw, Wally-heal, Ignition-waste,
-        Crushing Hammer, Budew/Item, Boss's Orders, bench-size,
-        matchup-evolution, no-attack-turn, Resentful-Refrain-timing /
-        Absolute-Snow-into-tank, deck-out-risk/Run-Away-Draw, Supporter-play
-        and Stadium terms below.
+        float: +1/-1 on a terminal step, otherwise the prize-differential
+        shaping term (with a multi-prize bonus) plus the evolve,
+        energy-attach, damage, draw, Wally-heal, Ignition-waste, Crushing
+        Hammer, Budew/Item, Boss's Orders, bench-size, matchup-evolution,
+        no-attack-turn, Resentful-Refrain-timing, Absolute-Snow-into-tank,
+        deck-out-risk/Run-Away-Draw, Supporter-play, and Stadium terms below.
     """
-    terms = dict.fromkeys(REWARD_TERMS, 0.0)
-
     if done:
-        terms["terminal"] = 1.0 if result == me_index else -1.0
-        return terms
+        return 1.0 if result == me_index else -1.0
 
     opp_index = 1 - me_index
     my_took = max(
@@ -719,39 +665,24 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
 
     no_attack_penalty = _no_attack_turn_penalty(prev_obs, cur_obs, me_index)
 
-    # Signed contributions -- penalties negated here so the total is a plain
-    # sum and each logged series reads with its true sign.
-    terms["prize_mine"] = my_prize_reward
-    terms["prize_opp"] = -opp_prize_reward
-    terms["evolve"] = evolve_reward
-    terms["energy_attach"] = energy_reward
-    terms["damage"] = damage_reward
-    terms["draw"] = draw_reward
-    terms["wally_heal"] = wally_reward
-    terms["ignition_waste"] = -ignition_penalty
-    terms["hammer"] = hammer_reward
-    terms["budew_item"] = budew_reward
-    terms["boss"] = boss_reward
-    terms["bench"] = -bench_penalty
-    terms["evolve_matchup"] = -evolve_matchup_penalty
-    terms["no_attack"] = -no_attack_penalty
-    # The Resentful Refrain penalty and the Absolute Snow bonus are mutually
-    # exclusive (each is 0 unless that attack was the one used), so they share
-    # one series rather than splitting into two mostly-empty ones.
-    terms["froslass_attack"] = froslass_attack_bonus - froslass_attack_penalty
-    terms["deck_save"] = deck_save_reward
-    terms["supporter"] = supporter_reward
-    terms["stadium"] = stadium_reward
-    return terms
-
-
-def compute_reward(prev_obs, cur_obs, done, result, me_index):
-    """Total reward from the acting player's perspective -- the sum of
-    reward_terms() (see it for the arguments and the term list).
-
-    Kept as the single-value entry point for callers that don't need the
-    breakdown. Callers that DO want both (CabtEnv, so it can ship the terms
-    out for TensorBoard) should call reward_terms() once and sum it rather
-    than calling both, since reward_terms() is not side-effect free.
-    """
-    return sum(reward_terms(prev_obs, cur_obs, done, result, me_index).values())
+    return (
+        my_prize_reward
+        - opp_prize_reward
+        + evolve_reward
+        + energy_reward
+        + damage_reward
+        + draw_reward
+        + wally_reward
+        - ignition_penalty
+        + hammer_reward
+        + budew_reward
+        + boss_reward
+        - bench_penalty
+        - evolve_matchup_penalty
+        - no_attack_penalty
+        - froslass_attack_penalty
+        + froslass_attack_bonus
+        + deck_save_reward
+        + supporter_reward
+        + stadium_reward
+    )
