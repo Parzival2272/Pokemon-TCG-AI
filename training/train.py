@@ -150,7 +150,14 @@ POLICY_KWARGS = _profile["policy_kwargs"] or dict(net_arch=list(POLICY_NET_ARCH)
 # Decays linearly from LR_START to LR_END over the first LR_DECAY_FRAC of
 # training, then holds LR_END flat for the remainder -- the "bottoming out".
 LR_START = float(os.environ.get("LR_START", 1e-4))
-LR_END = float(os.environ.get("LR_END", 3e-5))
+LR_END = float(os.environ.get("LR_END", 8e-5))  # was 3e-5: at the 3e-5 floor
+# approx_kl sat at 0.0029-0.0033 and clip_fraction at 0.026-0.030 in BOTH
+# MaskablePPO_14 and _15 -- below the healthy 0.003-0.03 / 0.05-0.2 bands --
+# while reward/terminal was still climbing. approx_kl tracked the LR almost
+# linearly across both runs (kl~0.010 at lr=1e-4, kl~0.003 at lr=3e-5,
+# regardless of how much training had already happened), so the updates were
+# LR-limited, not out of gradient signal: the schedule was annealing the run
+# to a standstill before it converged. 8e-5 should hold kl near 0.008.
 LR_DECAY_FRAC = float(os.environ.get("LR_DECAY_FRAC", 0.8))
 
 
@@ -232,6 +239,12 @@ if __name__ == "__main__":
         # SB3's default is 0.0; a small entropy bonus keeps the policy
         # exploring instead of collapsing onto one action pattern early.
         ent_coef=0.01,
+        # New. With the LR floor raised above, this is the guard against
+        # re-running MaskablePPO_14's opening, where lr=3e-4 drove approx_kl to
+        # 0.042 and clip_fraction to 0.22 in the first ~1M steps (that run was
+        # BEHIND _15 at every matched step despite the 3x larger LR). Early-stops
+        # the epoch loop on any update that would move the policy this far.
+        target_kl=0.03,
         tensorboard_log=TENSORBOARD_LOG_DIR,
     )
 

@@ -55,12 +55,18 @@ MULTI_PRIZE_MULTIPLIER = 1.25
 # Small bonus per evolution "me" performs since the previous decision. Kept
 # far below PRIZE_REWARD since evolving is a minor developmental move, not a
 # decisive event like a knockout.
-EVOLVE_REWARD = 0.02
+EVOLVE_REWARD = 0.005   # was 0.02: this term was silently dead (see LogType
+                        # note above). Measured over real games it fires ~10.7x
+                        # an episode, so 0.02 would inject +0.21/episode --
+                        # 5x the entire current shaping_total (+0.04) against a
+                        # +/-1.0 terminal. 0.005 keeps it the nudge the module
+                        # docstring says it is meant to be.
 
 # Very small bonus per energy card "me" attaches since the previous decision.
 # Smaller than EVOLVE_REWARD -- this just nudges the agent not to waste its
 # once-per-turn energy attachment, it isn't meant to carry much signal.
-ENERGY_ATTACH_REWARD = 0.01
+ENERGY_ATTACH_REWARD = 0.003  # was 0.01: dead term, ~13.5 energy attaches an
+                              # episode measured -> would add +0.14/episode.
 
 # Reward for damage "me" deals to any of the opponent's Pokemon (active or
 # bench) since the previous decision: 0.01 per 100 damage. Rewards chip
@@ -70,7 +76,12 @@ DAMAGE_REWARD_PER_100 = 0.01
 # Reward per card drawn since the previous decision (turn-start draw, Hilda,
 # Lillie's Determination, or Dudunsparce's Run Away Draw all count the same
 # way here -- see _draw_count).
-DRAW_REWARD_PER_CARD = 0.005
+DRAW_REWARD_PER_CARD = 0.001  # was 0.005: dead term, and the biggest of them
+                              # -- ~57 cards drawn an episode measured, so 0.005
+                              # injects +0.29/episode, rivalling the terminal
+                              # win/loss. Draw is also the most farmable of
+                              # these (the deck plays Iono/Iris/Run Away Draw),
+                              # so it gets the deepest cut.
 
 # Wally's Compassion (heal all damage from one Mega): a fixed -0.12 charge
 # plus 0.02 per 10 HP healed, breaking even around 60 HP healed and going
@@ -163,6 +174,28 @@ except Exception:
     CardType = None
     CARD_DB = {}
 
+# Log entry "type" is an IntEnum (ptcg.api.LogType) in the observation the
+# engine actually hands training: _get_battle_data()'s JSON in ptcg/game.py.
+# It is NOT the string name ("Evolve", "HpChange", ...) that vis.json shows --
+# vis.json comes from a DIFFERENT engine call (visualize_data()), which renders
+# the enum by name. Every helper below that compared entry["type"] against
+# those strings therefore never matched once, and its reward term logged
+# exactly 0.0 for entire multi-million-step runs (reward/draw, reward/evolve,
+# reward/damage, reward/energy_attach, reward/wally_heal, reward/ignition_waste
+# and reward/froslass_attack were all flat zero across MaskablePPO_14 and _15).
+# Values fall back to the documented ptcg/api.py LogType numbers if ptcg.api
+# isn't importable, rather than silently zeroing again -- that exact silent
+# failure is what this comment exists to prevent recurring.
+try:
+    from ptcg.api import LogType as _LogType
+    LOG_DRAW = int(_LogType.DRAW)
+    LOG_ATTACH = int(_LogType.ATTACH)
+    LOG_EVOLVE = int(_LogType.EVOLVE)
+    LOG_ATTACK = int(_LogType.ATTACK)
+    LOG_HP_CHANGE = int(_LogType.HP_CHANGE)
+except Exception:
+    LOG_DRAW, LOG_ATTACH, LOG_EVOLVE, LOG_ATTACK, LOG_HP_CHANGE = 4, 11, 12, 15, 16
+
 
 def _nth_attack_id(card_id, n):
     data = CARD_DB.get(card_id)
@@ -222,7 +255,7 @@ def _evolve_count(obs_dict, player_index):
     for entry in obs_dict.get("logs") or []:
         if (
             isinstance(entry, dict)
-            and entry.get("type") == "Evolve"
+            and entry.get("type") == LOG_EVOLVE
             and entry.get("playerIndex") == player_index
         ):
             count += 1
@@ -245,7 +278,7 @@ def _energy_attach_count(obs_dict, player_index):
     for entry in obs_dict.get("logs") or []:
         if (
             isinstance(entry, dict)
-            and entry.get("type") == "Attach"
+            and entry.get("type") == LOG_ATTACH
             and entry.get("playerIndex") == player_index
             and _is_energy_card(entry.get("cardId"))
         ):
@@ -272,7 +305,7 @@ def _damage_dealt(obs_dict, target_player_index):
     for entry in obs_dict.get("logs") or []:
         if not (
             isinstance(entry, dict)
-            and entry.get("type") == "HpChange"
+            and entry.get("type") == LOG_HP_CHANGE
             and entry.get("playerIndex") == target_player_index
         ):
             continue
@@ -377,7 +410,7 @@ def _draw_count(obs_dict, player_index):
     """
     total = 0
     for entry in obs_dict.get("logs") or []:
-        if not (isinstance(entry, dict) and entry.get("type") == "Draw"
+        if not (isinstance(entry, dict) and entry.get("type") == LOG_DRAW
                 and entry.get("playerIndex") == player_index):
             continue
         amount = entry.get("count", entry.get("amount"))
@@ -392,7 +425,7 @@ def _heal_dealt(obs_dict, player_index):
     heal, there is no isRecover field)."""
     total = 0
     for entry in obs_dict.get("logs") or []:
-        if not (isinstance(entry, dict) and entry.get("type") == "HpChange"
+        if not (isinstance(entry, dict) and entry.get("type") == LOG_HP_CHANGE
                 and entry.get("playerIndex") == player_index):
             continue
         value = entry.get("value")
@@ -418,7 +451,7 @@ def _attack_id_used(obs_dict, player_index):
     in this file, not independently confirmed.
     """
     for entry in obs_dict.get("logs") or []:
-        if (isinstance(entry, dict) and entry.get("type") == "Attack"
+        if (isinstance(entry, dict) and entry.get("type") == LOG_ATTACK
                 and entry.get("playerIndex") == player_index):
             return entry.get("attackId")
     return None
@@ -486,7 +519,7 @@ def _no_attack_turn_penalty(prev_obs, cur_obs, me_index):
         return 0.0
     _turns_taken[me_index] = _turns_taken.get(me_index, 0) + 1
     attacked = any(
-        isinstance(e, dict) and e.get("type") == "Attack" and e.get("playerIndex") == me_index
+        isinstance(e, dict) and e.get("type") == LOG_ATTACK and e.get("playerIndex") == me_index
         for e in (cur_obs.get("logs") or [])
     )
     if _turns_taken[me_index] >= 2 and not attacked:
