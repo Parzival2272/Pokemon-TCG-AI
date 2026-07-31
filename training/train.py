@@ -119,6 +119,8 @@ N_ENVS = int(
 SNAPSHOT_DIR = "./league_snapshots"
 SNAPSHOT_FREQ = 100_000
 MAX_SNAPSHOTS = 5
+TENSORBOARD_LOG_DIR = os.path.abspath("./ppo_cabt_logs")
+os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
 
 # Split workers between league self-play (vs frozen snapshots, see above) and
 # a heuristic opponent (directly optimizes for beating the known baselines --
@@ -141,6 +143,35 @@ N_EPOCHS = int(os.environ.get("N_EPOCHS", _profile["n_epochs"]))
 # the BC model used (load_state_dict is strict), so default both profiles to
 # the shared POLICY_NET_ARCH unless a profile explicitly pins its own kwargs.
 POLICY_KWARGS = _profile["policy_kwargs"] or dict(net_arch=list(POLICY_NET_ARCH))
+
+# Learning-rate schedule: start high so early updates move the policy off its
+# random/BC init quickly, then decay to a floor so late training refines
+# instead of thrashing (a constant 1e-4 does neither well over 30M steps).
+# Decays linearly from LR_START to LR_END over the first LR_DECAY_FRAC of
+# training, then holds LR_END flat for the remainder -- the "bottoming out".
+LR_START = float(os.environ.get("LR_START", 1e-4))
+LR_END = float(os.environ.get("LR_END", 8e-5))  # was 3e-5: at the 3e-5 floor
+# approx_kl sat at 0.0029-0.0033 and clip_fraction at 0.026-0.030 in BOTH
+# MaskablePPO_14 and _15 -- below the healthy 0.003-0.03 / 0.05-0.2 bands --
+# while reward/terminal was still climbing. approx_kl tracked the LR almost
+# linearly across both runs (kl~0.010 at lr=1e-4, kl~0.003 at lr=3e-5,
+# regardless of how much training had already happened), so the updates were
+# LR-limited, not out of gradient signal: the schedule was annealing the run
+# to a standstill before it converged. 8e-5 should hold kl near 0.008.
+LR_DECAY_FRAC = float(os.environ.get("LR_DECAY_FRAC", 0.8))
+
+
+def linear_decay_to_floor(start: float, end: float, decay_frac: float):
+    """SB3 schedule: takes progress_remaining (1.0 at start -> 0.0 at end)."""
+
+    def schedule(progress_remaining: float) -> float:
+        progress = 1.0 - progress_remaining  # 0.0 -> 1.0 as training advances
+        if decay_frac <= 0:
+            return end
+        frac = min(progress / decay_frac, 1.0)
+        return start + frac * (end - start)
+
+    return schedule
 
 
 def mask_fn(env):
@@ -189,13 +220,17 @@ if __name__ == "__main__":
     env = SubprocVecEnv(env_fns)
 
     print(f"Training on device: {DEVICE}")
+    print(
+        f"LR schedule: {LR_START:.1e} -> {LR_END:.1e} over the first "
+        f"{LR_DECAY_FRAC:.0%} of training, then flat"
+    )
 
     model = MaskablePPO(
         "MlpPolicy",
         env,
         verbose=1,
         device=DEVICE,
-        learning_rate=1e-4,
+        learning_rate=linear_decay_to_floor(LR_START, LR_END, LR_DECAY_FRAC),
         n_steps=N_STEPS,  # N_STEPS * N_ENVS ~= TARGET_SAMPLES_PER_UPDATE
         batch_size=BATCH_SIZE,
         n_epochs=N_EPOCHS,
@@ -204,7 +239,13 @@ if __name__ == "__main__":
         # SB3's default is 0.0; a small entropy bonus keeps the policy
         # exploring instead of collapsing onto one action pattern early.
         ent_coef=0.01,
-        tensorboard_log="./ppo_cabt_logs/",
+        # New. With the LR floor raised above, this is the guard against
+        # re-running MaskablePPO_14's opening, where lr=3e-4 drove approx_kl to
+        # 0.042 and clip_fraction to 0.22 in the first ~1M steps (that run was
+        # BEHIND _15 at every matched step despite the 3x larger LR). Early-stops
+        # the epoch loop on any update that would move the policy this far.
+        target_kl=0.03,
+        tensorboard_log=TENSORBOARD_LOG_DIR,
     )
 
     # Warm start: BC_INIT=<path.zip> copies the policy weights (actor AND
@@ -221,7 +262,7 @@ if __name__ == "__main__":
         model.policy.load_state_dict(params["policy"])
         print(f"Warm-started policy from {bc_init}")
 
-    total_timesteps = 30_000_000
+    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 15_000_000))
     win_rate_cb = WinRateCallback()  # snapshot_cb was built above, before the envs
     reward_term_cb = RewardTermCallback()
 
@@ -232,7 +273,7 @@ if __name__ == "__main__":
     )
     elapsed = time.perf_counter() - start
 
-    model_name = "ppo_starmie_v13"
+    model_name = "ppo_starmie_v16"
     model.save(model_name)
 
     # ---- End-of-training report -------------------------------------------
@@ -249,6 +290,10 @@ if __name__ == "__main__":
     print("=" * 60)
     print(f"Device               : {DEVICE}")
     print(f"Parallel envs        : {N_ENVS}")
+    print(
+        f"Learning rate        : {LR_START:.1e} -> {LR_END:.1e} "
+        f"(linear over first {LR_DECAY_FRAC:.0%}, then flat)"
+    )
     print(f"Timesteps            : {steps_done:,} / {total_timesteps:,}")
     print(f"Wall-clock time      : {timedelta(seconds=round(elapsed))} ({elapsed:.1f}s)")
     print(f"Average FPS          : {avg_fps:,.0f} steps/s")

@@ -48,7 +48,6 @@ ptcg isn't importable.
 
 from collections import Counter
 
-
 # Weight of one prize swing. Kept well under 1.0 so the terminal win/loss
 # stays the dominant signal: at most 6 prizes -> +/-0.6 of shaping vs the
 # +/-1.0 outcome reward.
@@ -64,12 +63,18 @@ MULTI_PRIZE_MULTIPLIER = 1.25
 # Small bonus per evolution "me" performs since the previous decision. Kept
 # far below PRIZE_REWARD since evolving is a minor developmental move, not a
 # decisive event like a knockout.
-EVOLVE_REWARD = 0.02
+EVOLVE_REWARD = 0.005  # was 0.02: this term was silently dead (see LogType
+# note above). Measured over real games it fires ~10.7x
+# an episode, so 0.02 would inject +0.21/episode --
+# 5x the entire current shaping_total (+0.04) against a
+# +/-1.0 terminal. 0.005 keeps it the nudge the module
+# docstring says it is meant to be.
 
 # Very small bonus per energy card "me" attaches since the previous decision.
 # Smaller than EVOLVE_REWARD -- this just nudges the agent not to waste its
 # once-per-turn energy attachment, it isn't meant to carry much signal.
-ENERGY_ATTACH_REWARD = 0.01
+ENERGY_ATTACH_REWARD = 0.003  # was 0.01: dead term, ~13.5 energy attaches an
+# episode measured -> would add +0.14/episode.
 
 # Reward for damage "me" deals to any of the opponent's Pokemon (active or
 # bench) since the previous decision: 0.01 per 100 damage. Rewards chip
@@ -79,7 +84,12 @@ DAMAGE_REWARD_PER_100 = 0.01
 # Reward per card drawn since the previous decision (turn-start draw, Hilda,
 # Lillie's Determination, or Dudunsparce's Run Away Draw all count the same
 # way here -- see _draw_count).
-DRAW_REWARD_PER_CARD = 0.005
+DRAW_REWARD_PER_CARD = 0.001  # was 0.005: dead term, and the biggest of them
+# -- ~57 cards drawn an episode measured, so 0.005
+# injects +0.29/episode, rivalling the terminal
+# win/loss. Draw is also the most farmable of
+# these (the deck plays Iono/Iris/Run Away Draw),
+# so it gets the deepest cut.
 
 # Wally's Compassion (heal all damage from one Mega): a fixed -0.12 charge
 # plus 0.02 per 10 HP healed, breaking even around 60 HP healed and going
@@ -114,8 +124,12 @@ BENCH_OVER_4_PENALTY = 0.05
 BENCH_OVER_5_PENALTY = 0.10
 
 # Matchup-specific evolution penalties.
-IONO_BELLIBOLT_EVOLVE_PENALTY = 0.5   # evolving into Mega Starmie ex vs Iono's Bellibolt ex
-ARCHALUDON_EVOLVE_PENALTY = 0.5       # evolving into Mega Froslass ex vs Archaludon ex, still 3+ prizes down
+IONO_BELLIBOLT_EVOLVE_PENALTY = (
+    0.5  # evolving into Mega Starmie ex vs Iono's Bellibolt ex
+)
+ARCHALUDON_EVOLVE_PENALTY = (
+    0.5  # evolving into Mega Froslass ex vs Archaludon ex, still 3+ prizes down
+)
 
 # Ending our own turn (2nd turn onward) without having attacked.
 NO_ATTACK_PENALTY = 0.05
@@ -157,36 +171,45 @@ STADIUM_BUMP_REWARD = 0.05
 # every term below that depends on it just contributes 0 instead of raising.
 
 STARYU_ID = 1030
-STARMIE_ID = 1031      # Mega Starmie ex
-SNORUNT_ID = 103        # Snorunt (TWM printing; 860 is the ASC alt)
-FROSLASS_ID = 861       # Mega Froslass ex
-BOSS_ID = 1182          # Boss's Orders
-HAMMER_ID = 1120        # Crushing Hammer
-IGNITION_ID = 17        # Ignition Energy
-DUDUNSPARCE_ID = 66     # Dudunsparce (Run Away Draw)
+STARMIE_ID = 1031  # Mega Starmie ex
+SNORUNT_ID = 103  # Snorunt (TWM printing; 860 is the ASC alt)
+FROSLASS_ID = 861  # Mega Froslass ex
+BOSS_ID = 1182  # Boss's Orders
+HAMMER_ID = 1120  # Crushing Hammer
+IGNITION_ID = 17  # Ignition Energy
+DUDUNSPARCE_ID = 66  # Dudunsparce (Run Away Draw)
 
 try:
     from ptcg.api import all_card_data, CardType, LogType
+
     CARD_DB = {c.cardId: c for c in all_card_data()}
 except Exception:
     CardType = None
     LogType = None
     CARD_DB = {}
 
+# Log entry "type" is an IntEnum (ptcg.api.LogType) in the observation the
+# engine actually hands training: _get_battle_data()'s JSON in ptcg/game.py.
+# It is NOT the string name ("Evolve", "HpChange", ...) that vis.json shows --
+# vis.json comes from a DIFFERENT engine call (visualize_data()), which renders
+# the enum by name. Every helper below that compared entry["type"] against
+# those strings therefore never matched once, and its reward term logged
+# exactly 0.0 for entire multi-million-step runs (reward/draw, reward/evolve,
+# reward/damage, reward/energy_attach, reward/wally_heal, reward/ignition_waste
+# and reward/froslass_attack were all flat zero across MaskablePPO_14 and _15).
+# Values fall back to the documented ptcg/api.py LogType numbers if ptcg.api
+# isn't importable, rather than silently zeroing again -- that exact silent
+# failure is what this comment exists to prevent recurring.
+try:
+    from ptcg.api import LogType as _LogType
 
-# Log event types. An obs["logs"] entry's "type" is the raw IntEnum VALUE (an
-# int like 16), never the member name -- so the string comparisons this file
-# used to make ("Evolve", "Attach", "HpChange", "Draw", "Attack") matched
-# nothing, ever, and every term derived from them contributed exactly 0.0 for
-# whole training runs. Verified against ptcg/api.py's LogType and a live game.
-# Falls back to the documented values so a missing ptcg import degrades the
-# same way the CARD_DB-dependent terms do rather than raising at import.
-LOG_TURN_END = int(LogType.TURN_END) if LogType else 3
-LOG_DRAW = int(LogType.DRAW) if LogType else 4
-LOG_ATTACH = int(LogType.ATTACH) if LogType else 11
-LOG_EVOLVE = int(LogType.EVOLVE) if LogType else 12
-LOG_ATTACK = int(LogType.ATTACK) if LogType else 15
-LOG_HP_CHANGE = int(LogType.HP_CHANGE) if LogType else 16
+    LOG_DRAW = int(_LogType.DRAW)
+    LOG_ATTACH = int(_LogType.ATTACH)
+    LOG_EVOLVE = int(_LogType.EVOLVE)
+    LOG_ATTACK = int(_LogType.ATTACK)
+    LOG_HP_CHANGE = int(_LogType.HP_CHANGE)
+except Exception:
+    LOG_DRAW, LOG_ATTACH, LOG_EVOLVE, LOG_ATTACK, LOG_HP_CHANGE = 4, 11, 12, 15, 16
 
 
 def _nth_attack_id(card_id, n):
@@ -257,44 +280,70 @@ def _log_entries(obs_dict, log_type, player_index):
 
 
 def _evolve_count(obs_dict, player_index):
-    """Count EVOLVE events by player_index since the previous decision."""
-    return len(_log_entries(obs_dict, LOG_EVOLVE, player_index))
+    """Count Evolve events attributed to player_index since the previous decision.
+
+    Verified against real obs["logs"] dumps (vis.json): Evolve entries have
+    fields {type, playerIndex, cardId, cardIdTarget, serial, serialTarget},
+    matching this function's assumption exactly.
+    """
+    count = 0
+    for entry in obs_dict.get("logs") or []:
+        if (
+            isinstance(entry, dict)
+            and entry.get("type") == LOG_EVOLVE
+            and entry.get("playerIndex") == player_index
+        ):
+            count += 1
+    return count
 
 
 def _energy_attach_count(obs_dict, player_index):
     """Count energy attachments by player_index since the previous decision.
 
-    One ATTACH type covers both Energy and Pokemon Tools, and the entry
-    identifies the attached card by cardId/serial (there is no energyIndex
-    field -- that was a guess, and its absence is why this term was dead), so
-    Energy is separated from Tools by looking cardId up in CARD_DB. Fails safe
-    to 0 if CARD_DB is unavailable, since _is_energy_card returns None then.
+    Verified against real obs["logs"] dumps (vis.json): Attach entries have
+    fields {type, playerIndex, cardId, serial, cardIdTarget, serialTarget} --
+    there is no separate energyIndex/toolIndex field, and tool attaches (e.g.
+    Lucky Helmet) use the exact same shape as energy attaches. The only way
+    to tell them apart is the attached card's own type, so this checks
+    _is_energy_card(cardId) instead. Needs CARD_DB to distinguish energy from
+    tool; contributes 0 (fails safe) if CARD_DB is unavailable, same as the
+    other CARD_DB-dependent helpers below.
     """
-    return sum(
-        1
-        for e in _log_entries(obs_dict, LOG_ATTACH, player_index)
-        if _is_energy_card(e.get("cardId"))
-    )
+    count = 0
+    for entry in obs_dict.get("logs") or []:
+        if (
+            isinstance(entry, dict)
+            and entry.get("type") == LOG_ATTACH
+            and entry.get("playerIndex") == player_index
+            and _is_energy_card(entry.get("cardId"))
+        ):
+            count += 1
+    return count
 
 
 def _damage_dealt(obs_dict, target_player_index):
     """Sum HP lost by target_player_index's Pokemon (active + bench) since the
-    previous decision, from HP_CHANGE log entries.
+    previous decision, from HpChange log entries.
 
-    HP_CHANGE.value is SIGNED -- negative is HP lost, positive is healing --
-    which the old string-matching version got backwards: it summed `value > 0`
-    as damage, so had its type check ever matched it would have paid the agent
-    for healing the opponent. Verified on live logs: the sign always tracks the
-    board's HP delta (never its negation), and healing entries are exactly the
-    positive ones.
-
-    `putDamageCounter` is deliberately ignored: it flags whether the change
-    came from the damage-counter mechanic and appears on BOTH damage and
-    heals, so it says nothing about direction. Bench damage counts the same as
-    active damage (spread attacks are real damage).
+    Verified against real obs["logs"] dumps (vis.json) by tracing a Pokemon's
+    "hp" field across consecutive states against its HpChange entries: fields
+    are {"type": "HpChange", "playerIndex": <whose Pokemon changed>, "cardId",
+    "serial", "value": <signed HP delta>, "putDamageCounter": <bool>} -- there
+    is no separate isRecover field. "value" is the exact signed delta applied
+    to hp (negative for damage, positive for healing); putDamageCounter marks
+    whether the engine applied this particular delta as a 10-HP counter step
+    vs a direct HP set and doesn't affect which entries count as damage.
+    Deliberately doesn't filter by inPlayArea so bench damage (splash/spread
+    attacks) counts same as active damage.
     """
     total = 0
-    for entry in _log_entries(obs_dict, LOG_HP_CHANGE, target_player_index):
+    for entry in obs_dict.get("logs") or []:
+        if not (
+            isinstance(entry, dict)
+            and entry.get("type") == LOG_HP_CHANGE
+            and entry.get("playerIndex") == target_player_index
+        ):
+            continue
         value = entry.get("value")
         if isinstance(value, (int, float)) and value < 0:
             total += -value
@@ -302,6 +351,7 @@ def _damage_dealt(obs_dict, target_player_index):
 
 
 # ── Shared board/discard accessors ──
+
 
 def _players(obs_dict):
     return (obs_dict.get("current") or {}).get("players") or [{}, {}]
@@ -324,7 +374,9 @@ def _active_pokemon(obs_dict, player_index):
 
 
 def _count_in_play(obs_dict, player_index, card_id):
-    return sum(1 for m in _pokemon_in_play(obs_dict, player_index) if m.get("id") == card_id)
+    return sum(
+        1 for m in _pokemon_in_play(obs_dict, player_index) if m.get("id") == card_id
+    )
 
 
 def _opponent_has_any(obs_dict, card_ids, opp_index):
@@ -346,8 +398,16 @@ def _newly_discarded_ids(prev_obs, cur_obs, player_index):
     prev_players, cur_players = _players(prev_obs), _players(cur_obs)
     if player_index >= len(prev_players) or player_index >= len(cur_players):
         return []
-    prev_ids = Counter(c.get("id") for c in ((prev_players[player_index] or {}).get("discard") or []) if c)
-    cur_ids = Counter(c.get("id") for c in ((cur_players[player_index] or {}).get("discard") or []) if c)
+    prev_ids = Counter(
+        c.get("id")
+        for c in ((prev_players[player_index] or {}).get("discard") or [])
+        if c
+    )
+    cur_ids = Counter(
+        c.get("id")
+        for c in ((cur_players[player_index] or {}).get("discard") or [])
+        if c
+    )
     new_ids = []
     for cid, cnt in cur_ids.items():
         new_ids.extend([cid] * max(0, cnt - prev_ids.get(cid, 0)))
@@ -393,25 +453,42 @@ def _prize_value_by_id(card_id):
 
 # ── New shaping-term helpers ──
 
-def _draw_count(obs_dict, player_index):
-    """Cards drawn by player_index since the previous decision.
 
-    The engine emits ONE DRAW entry per card (each carrying that card's
-    cardId/serial), so a multi-card draw like Run Away Draw's "draw 3" is
-    three entries -- there is no count/amount field to sum, which the previous
-    version speculatively looked for. The opponent's draws arrive as
-    DRAW_REVERSE (card hidden) and are correctly not counted here.
+def _draw_count(obs_dict, player_index):
+    """Cards drawn by player_index since the previous decision, from Draw log
+    entries. Verified against real obs["logs"] dumps (vis.json): Draw entries
+    have fields {type, playerIndex, cardId, serial} -- one entry per card
+    drawn, with no count/amount field, so multi-card draws (e.g. Run Away
+    Draw's "draw 3") show up as multiple entries. The count/amount fallback
+    below is kept in case some draw effect ever emits a batched entry, but
+    every entry observed so far is single-card.
     """
-    return len(_log_entries(obs_dict, LOG_DRAW, player_index))
+    total = 0
+    for entry in obs_dict.get("logs") or []:
+        if not (
+            isinstance(entry, dict)
+            and entry.get("type") == LOG_DRAW
+            and entry.get("playerIndex") == player_index
+        ):
+            continue
+        amount = entry.get("count", entry.get("amount"))
+        total += amount if isinstance(amount, (int, float)) else 1
+    return total
 
 
 def _heal_dealt(obs_dict, player_index):
     """HP healed on player_index's own Pokemon since the previous decision --
-    the positive-`value` mirror of _damage_dealt (see it for the sign
-    convention; there is no isRecover field on HP_CHANGE, that belongs to the
-    special-condition log types)."""
+    the mirror image of _damage_dealt's negative-value branch (see there for
+    the vis.json verification of the HpChange schema: positive "value" is a
+    heal, there is no isRecover field)."""
     total = 0
-    for entry in _log_entries(obs_dict, LOG_HP_CHANGE, player_index):
+    for entry in obs_dict.get("logs") or []:
+        if not (
+            isinstance(entry, dict)
+            and entry.get("type") == LOG_HP_CHANGE
+            and entry.get("playerIndex") == player_index
+        ):
+            continue
         value = entry.get("value")
         if isinstance(value, (int, float)) and value > 0:
             total += value
@@ -422,20 +499,36 @@ def _active_has_ignition(obs_dict, player_index):
     mon = _active_pokemon(obs_dict, player_index)
     if not mon:
         return False
-    return any(isinstance(c, dict) and c.get("id") == IGNITION_ID
-               for c in (mon.get("energyCards") or []))
+    return any(
+        isinstance(c, dict) and c.get("id") == IGNITION_ID
+        for c in (mon.get("energyCards") or [])
+    )
 
 
 def _attack_id_used(obs_dict, player_index):
-    """attackId of an ATTACK log entry taken by player_index this step, if any
-    (None otherwise)."""
-    for entry in _log_entries(obs_dict, LOG_ATTACK, player_index):
-        return entry.get("attackId")
+    """attackId of an Attack log entry taken by player_index this step, if
+    any (None otherwise). "attackId"/"playerIndex" on Attack entries are
+    trusted -- starmie_agent.py already reads LogType.ATTACK's .attackId
+    directly (its Itchy Pollen check). The "Attack" string spelling of that
+    enum's raw value is inferred the same way as the other type-name guesses
+    in this file, not independently confirmed.
+    """
+    for entry in obs_dict.get("logs") or []:
+        if (
+            isinstance(entry, dict)
+            and entry.get("type") == LOG_ATTACK
+            and entry.get("playerIndex") == player_index
+        ):
+            return entry.get("attackId")
     return None
 
 
 def _items_played_count(prev_obs, cur_obs, player_index):
-    return sum(1 for cid in _newly_discarded_ids(prev_obs, cur_obs, player_index) if _is_item_card(cid))
+    return sum(
+        1
+        for cid in _newly_discarded_ids(prev_obs, cur_obs, player_index)
+        if _is_item_card(cid)
+    )
 
 
 def _boss_setup_reward(prev_obs, cur_obs, me_index, opp_index):
@@ -506,14 +599,19 @@ def _no_attack_turn_penalty(cur_obs, me_index):
         return 0.0
 
     _turns_taken[me_index] = _turns_taken.get(me_index, 0) + 1
-    attacked = _attacked_this_turn[me_index]
-    _attacked_this_turn[me_index] = False
+    attacked = any(
+        isinstance(e, dict)
+        and e.get("type") == LOG_ATTACK
+        and e.get("playerIndex") == me_index
+        for e in (cur_obs.get("logs") or [])
+    )
     if _turns_taken[me_index] >= 2 and not attacked:
         return NO_ATTACK_PENALTY
     return 0.0
 
 
 # ── Follow-up shaping-term helpers ──
+
 
 def _hand_size(obs_dict, player_index):
     """Cards in player_index's hand, from the public `handCount`.
@@ -570,7 +668,8 @@ def _supporter_played_count(prev_obs, cur_obs, player_index):
     WALLY_HEAL_BASE for why that's fine (its magnitude already keeps a
     low-value heal net-negative with this bonus stacked on top)."""
     return sum(
-        1 for cid in _newly_discarded_ids(prev_obs, cur_obs, player_index)
+        1
+        for cid in _newly_discarded_ids(prev_obs, cur_obs, player_index)
         if _is_supporter_card(cid)
     )
 
@@ -616,49 +715,26 @@ REWARD_TERMS = (
 
 
 def reward_terms(prev_obs, cur_obs, done, result, me_index):
-    """Per-term breakdown of the reward, keyed by REWARD_TERMS.
+    """Named breakdown of compute_reward's terms, keyed for per-component
+    logging (e.g. TensorBoard reward/<key> series) -- see compute_reward for
+    the single-value entry point callers that don't need the breakdown
+    should use instead.
 
-    Each value is that term's SIGNED contribution, so penalties are negative
-    and the total reward is just the sum -- compute_reward() is defined as
-    exactly that sum, so the two can never drift apart.
-
-    Call at most ONCE per step: _no_attack_turn_penalty advances per-player
-    turn state as a side effect, so a second call would double-count turns.
-
-    Args:
-        prev_obs: the observation the action was chosen from (non-terminal).
-        cur_obs: observation after this action (and any opponent auto-play).
-        done: True if the battle ended on this step.
-        result: winning player index (== me_index means "me" won).
-        me_index: absolute index (0/1) of the acting player -- the fixed
-            learner vs a heuristic opponent, or the mover in self-play.
-
-    Returns:
-        dict[str, float]: every REWARD_TERMS key, zero-filled. A terminal step
-        is +1/-1 in "terminal" with all shaping zero; every other step carries
-        the prize-differential term (with a multi-prize bonus) plus the
-        evolve, energy-attach, damage, draw, Wally-heal, Ignition-waste,
-        Crushing Hammer, Budew/Item, Boss's Orders, bench-size,
-        matchup-evolution, no-attack-turn, Resentful-Refrain-timing /
-        Absolute-Snow-into-tank, deck-out-risk/Run-Away-Draw, Supporter-play
-        and Stadium terms below.
+    Args/Returns semantics match compute_reward, except a terminal step
+    returns a single {"terminal": +-1.0} entry instead of the full shaping
+    breakdown (there's nothing to shape once the game is over).
     """
-    terms = dict.fromkeys(REWARD_TERMS, 0.0)
-
     if done:
-        terms["terminal"] = 1.0 if result == me_index else -1.0
-        return terms
+        return {"terminal": 1.0 if result == me_index else -1.0}
 
     opp_index = 1 - me_index
     my_took = max(
         0,
-        _prizes_remaining(prev_obs, me_index)
-        - _prizes_remaining(cur_obs, me_index),
+        _prizes_remaining(prev_obs, me_index) - _prizes_remaining(cur_obs, me_index),
     )
     opp_took = max(
         0,
-        _prizes_remaining(prev_obs, opp_index)
-        - _prizes_remaining(cur_obs, opp_index),
+        _prizes_remaining(prev_obs, opp_index) - _prizes_remaining(cur_obs, opp_index),
     )
 
     my_prize_reward = PRIZE_REWARD * my_took
@@ -673,7 +749,9 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
     draw_reward = DRAW_REWARD_PER_CARD * _draw_count(cur_obs, me_index)
 
     healed = _heal_dealt(cur_obs, me_index)
-    wally_reward = (WALLY_HEAL_BASE + WALLY_HEAL_PER_10HP * (healed / 10)) if healed > 0 else 0.0
+    wally_reward = (
+        (WALLY_HEAL_BASE + WALLY_HEAL_PER_10HP * (healed / 10)) if healed > 0 else 0.0
+    )
 
     used_attack = _attack_id_used(cur_obs, me_index)
 
@@ -684,7 +762,10 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
 
     froslass_attack_penalty = 0.0
     froslass_attack_bonus = 0.0
-    if used_attack is not None and used_attack in (RESENTFUL_REFRAIN_ID, ABSOLUTE_SNOW_ID):
+    if used_attack is not None and used_attack in (
+        RESENTFUL_REFRAIN_ID,
+        ABSOLUTE_SNOW_ID,
+    ):
         refrain_damage = 50 * _hand_size(prev_obs, opp_index)
         if used_attack == RESENTFUL_REFRAIN_ID:
             if refrain_damage <= 100 and _mega_starmie_available(prev_obs, me_index):
@@ -697,32 +778,48 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
 
     deck_save_reward = 0.0
     if _deck_remaining(prev_obs, me_index) <= DECK_OUT_RISK_THRESHOLD:
-        ran_away = (_count_in_play(prev_obs, me_index, DUDUNSPARCE_ID)
-                    > _count_in_play(cur_obs, me_index, DUDUNSPARCE_ID))
+        ran_away = _count_in_play(prev_obs, me_index, DUDUNSPARCE_ID) > _count_in_play(
+            cur_obs, me_index, DUDUNSPARCE_ID
+        )
         if ran_away:
             deck_save_reward = RUN_AWAY_DRAW_DECK_SAVE_REWARD
 
-    supporter_reward = SUPPORTER_PLAY_REWARD * _supporter_played_count(prev_obs, cur_obs, me_index)
+    supporter_reward = SUPPORTER_PLAY_REWARD * _supporter_played_count(
+        prev_obs, cur_obs, me_index
+    )
 
     stadium_reward = 0.0
     prev_stadium = _stadium_identity(prev_obs)
     cur_stadium = _stadium_identity(cur_obs)
-    if cur_stadium is not None and cur_stadium[1] == me_index and cur_stadium != prev_stadium:
+    if (
+        cur_stadium is not None
+        and cur_stadium[1] == me_index
+        and cur_stadium != prev_stadium
+    ):
         stadium_reward = STADIUM_PLAY_REWARD
         if prev_stadium is not None and prev_stadium[1] == opp_index:
             stadium_reward += STADIUM_BUMP_REWARD
 
     hammer_played = HAMMER_ID in _newly_discarded_ids(prev_obs, cur_obs, me_index)
-    opp_energy_lost = any(_is_energy_card(cid) for cid in _newly_discarded_ids(prev_obs, cur_obs, opp_index))
-    hammer_reward = HAMMER_DISCARD_REWARD if (hammer_played and opp_energy_lost) else 0.0
+    opp_energy_lost = any(
+        _is_energy_card(cid)
+        for cid in _newly_discarded_ids(prev_obs, cur_obs, opp_index)
+    )
+    hammer_reward = (
+        HAMMER_DISCARD_REWARD if (hammer_played and opp_energy_lost) else 0.0
+    )
 
     budew_reward = 0.0
     if BUDEW_IDS and _opponent_has_any(prev_obs, BUDEW_IDS, opp_index):
-        budew_reward = ITEM_VS_BUDEW_REWARD * _items_played_count(prev_obs, cur_obs, me_index)
+        budew_reward = ITEM_VS_BUDEW_REWARD * _items_played_count(
+            prev_obs, cur_obs, me_index
+        )
 
     boss_reward = _boss_setup_reward(prev_obs, cur_obs, me_index, opp_index)
 
-    basics_in_play = _count_in_play(cur_obs, me_index, STARYU_ID) + _count_in_play(cur_obs, me_index, SNORUNT_ID)
+    basics_in_play = _count_in_play(cur_obs, me_index, STARYU_ID) + _count_in_play(
+        cur_obs, me_index, SNORUNT_ID
+    )
     if basics_in_play > 5:
         bench_penalty = BENCH_OVER_5_PENALTY
     elif basics_in_play > 4:
@@ -731,18 +828,31 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
         bench_penalty = 0.0
 
     evolve_matchup_penalty = 0.0
-    starmie_evolved = _count_in_play(cur_obs, me_index, STARMIE_ID) > _count_in_play(prev_obs, me_index, STARMIE_ID)
-    froslass_evolved = _count_in_play(cur_obs, me_index, FROSLASS_ID) > _count_in_play(prev_obs, me_index, FROSLASS_ID)
-    if starmie_evolved and IONO_BELLIBOLT_IDS and _opponent_has_any(prev_obs, IONO_BELLIBOLT_IDS, opp_index):
+    starmie_evolved = _count_in_play(cur_obs, me_index, STARMIE_ID) > _count_in_play(
+        prev_obs, me_index, STARMIE_ID
+    )
+    froslass_evolved = _count_in_play(cur_obs, me_index, FROSLASS_ID) > _count_in_play(
+        prev_obs, me_index, FROSLASS_ID
+    )
+    if (
+        starmie_evolved
+        and IONO_BELLIBOLT_IDS
+        and _opponent_has_any(prev_obs, IONO_BELLIBOLT_IDS, opp_index)
+    ):
         evolve_matchup_penalty += IONO_BELLIBOLT_EVOLVE_PENALTY
-    if (froslass_evolved and ARCHALUDON_IDS and _opponent_has_any(prev_obs, ARCHALUDON_IDS, opp_index)
-            and _prizes_remaining(prev_obs, me_index) > 2):
+    if (
+        froslass_evolved
+        and ARCHALUDON_IDS
+        and _opponent_has_any(prev_obs, ARCHALUDON_IDS, opp_index)
+        and _prizes_remaining(prev_obs, me_index) > 2
+    ):
         evolve_matchup_penalty += ARCHALUDON_EVOLVE_PENALTY
 
     no_attack_penalty = _no_attack_turn_penalty(cur_obs, me_index)
 
     # Signed contributions -- penalties negated here so the total is a plain
     # sum and each logged series reads with its true sign.
+    terms = {}
     terms["prize_mine"] = my_prize_reward
     terms["prize_opp"] = -opp_prize_reward
     terms["evolve"] = evolve_reward
@@ -769,7 +879,7 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
 
 def compute_reward(prev_obs, cur_obs, done, result, me_index):
     """Total reward from the acting player's perspective -- the sum of
-    reward_terms() (see it for the arguments and the term list).
+    reward_terms() (see it for the term list and the arguments).
 
     Kept as the single-value entry point for callers that don't need the
     breakdown. Callers that DO want both (CabtEnv, so it can ship the terms
