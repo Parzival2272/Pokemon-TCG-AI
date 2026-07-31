@@ -579,40 +579,18 @@ REWARD_TERMS = (
     "stadium",
 )
 
-
 def reward_terms(prev_obs, cur_obs, done, result, me_index):
-    """Per-term breakdown of the reward, keyed by REWARD_TERMS.
+    """Named breakdown of compute_reward's terms, keyed for per-component
+    logging (e.g. TensorBoard reward/<key> series) -- see compute_reward for
+    the single-value entry point callers that don't need the breakdown
+    should use instead.
 
-    Each value is that term's SIGNED contribution, so penalties are negative
-    and the total reward is just the sum -- compute_reward() is defined as
-    exactly that sum, so the two can never drift apart.
-
-    Call at most ONCE per step: _no_attack_turn_penalty advances per-player
-    turn state as a side effect, so a second call would double-count turns.
-
-    Args:
-        prev_obs: the observation the action was chosen from (non-terminal).
-        cur_obs: observation after this action (and any opponent auto-play).
-        done: True if the battle ended on this step.
-        result: winning player index (== me_index means "me" won).
-        me_index: absolute index (0/1) of the acting player -- the fixed
-            learner vs a heuristic opponent, or the mover in self-play.
-
-    Returns:
-        dict[str, float]: every REWARD_TERMS key, zero-filled. A terminal step
-        is +1/-1 in "terminal" with all shaping zero; every other step carries
-        the prize-differential term (with a multi-prize bonus) plus the
-        evolve, energy-attach, damage, draw, Wally-heal, Ignition-waste,
-        Crushing Hammer, Budew/Item, Boss's Orders, bench-size,
-        matchup-evolution, no-attack-turn, Resentful-Refrain-timing /
-        Absolute-Snow-into-tank, deck-out-risk/Run-Away-Draw, Supporter-play
-        and Stadium terms below.
+    Args/Returns semantics match compute_reward, except a terminal step
+    returns a single {"terminal": +-1.0} entry instead of the full shaping
+    breakdown (there's nothing to shape once the game is over).
     """
-    terms = dict.fromkeys(REWARD_TERMS, 0.0)
-
     if done:
-        terms["terminal"] = 1.0 if result == me_index else -1.0
-        return terms
+        return {"terminal": 1.0 if result == me_index else -1.0}
 
     opp_index = 1 - me_index
     my_took = max(
@@ -708,6 +686,7 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
 
     # Signed contributions -- penalties negated here so the total is a plain
     # sum and each logged series reads with its true sign.
+    terms = {}
     terms["prize_mine"] = my_prize_reward
     terms["prize_opp"] = -opp_prize_reward
     terms["evolve"] = evolve_reward
@@ -734,7 +713,7 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
 
 def compute_reward(prev_obs, cur_obs, done, result, me_index):
     """Total reward from the acting player's perspective -- the sum of
-    reward_terms() (see it for the arguments and the term list).
+    reward_terms() (see it for the term list and the arguments).
 
     Kept as the single-value entry point for callers that don't need the
     breakdown. Callers that DO want both (CabtEnv, so it can ship the terms

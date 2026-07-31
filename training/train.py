@@ -1,695 +1,305 @@
-"""Reward shaping for the RL learner (used by CabtEnv in both modes).
-
-Rewards are always from the perspective of the player who took the step's
-action -- "me" (an absolute player index). In heuristic-opponent mode that's
-the fixed learner side; in self-play it's whichever player was to move
-(prev_obs's yourIndex), since the reward is paired with prev_obs in the
-rollout.
-
-The base signal is the sparse terminal +1 win / -1 loss. Because a game spans
-hundreds of decisions, that alone is a very thin gradient, so on non-terminal
-steps we add a dense prize-differential term: reward for each prize "me" takes,
-penalty for each prize the opponent takes since the previous decision. On top
-of that there's a small bonus for taking multiple prizes in the same step
-(a multi-knockout swing), a slight bonus for evolving a Pokemon, a very
-small bonus for attaching an energy card, and a small bonus for damage "me"
-deals to any of the opponent's Pokemon -- active or bench.
-
-Prize mechanic (verified against the engine): you take from your OWN prize pile
-when you knock out an opponent's Pokemon, so a player's remaining prize count
-*decreases* as they win, reaching 0 on a prize-out win. Hence "prizes taken" is
-prev_remaining - now_remaining. Counts are read by absolute player index, so the
-term is independent of whose turn the observation reflects. Each side's "taken"
-is clamped to >= 0 so the setup-time jump from 0 to 6 prizes (and rare
-prize-returning effects) doesn't register as a swing.
-
-On top of the original terms above, this file also adds a batch of
-deck-specific shaping terms for the Mega Starmie ex / Mega Froslass ex list
-(see starmie_agent.py for the full deck/strategy writeup this leans on):
-card draw, Wally's Compassion healing, wasting an attached Ignition Energy on
-a non-Nebula-Beam attack, landing Crushing Hammer, playing Items while the
-opponent has Budew in play, Boss's Orders setting up a good KO, overfilling
-the attacker bench, two matchup-specific evolution penalties, and failing to
-attack on our 2nd turn or later. Several of these need card/attack IDs or
-log-event names this file has no way to verify from here -- each helper below
-documents its specific guess and fails safe (contributes 0) rather than
-raising if the real schema differs. Confirm the flagged ones against real
-obs["logs"]/obs["current"] dumps before trusting them in training.
-"""
-
-from collections import Counter
-
-
-# Weight of one prize swing. Kept well under 1.0 so the terminal win/loss
-# stays the dominant signal: at most 6 prizes -> +/-0.6 of shaping vs the
-# +/-1.0 outcome reward.
-PRIZE_REWARD = 0.1
-
-# Extra multiplier on my_took's prize reward when 2+ prizes are taken in a
-# single step (e.g. a single attack knocking out a multi-prize Pokemon, or
-# two knockouts before the next decision point). Rewards the tempo/value of
-# a multi-prize turn without letting it swamp the base per-prize signal:
-# two prizes -> 0.25 instead of the linear 0.2.
-MULTI_PRIZE_MULTIPLIER = 1.25
-
-# Small bonus per evolution "me" performs since the previous decision. Kept
-# far below PRIZE_REWARD since evolving is a minor developmental move, not a
-# decisive event like a knockout.
-EVOLVE_REWARD = 0.02
-
-# Very small bonus per energy card "me" attaches since the previous decision.
-# Smaller than EVOLVE_REWARD -- this just nudges the agent not to waste its
-# once-per-turn energy attachment, it isn't meant to carry much signal.
-ENERGY_ATTACH_REWARD = 0.01
-
-# Reward for damage "me" deals to any of the opponent's Pokemon (active or
-# bench) since the previous decision: 0.01 per 100 damage. Rewards chip
-# damage/setup toward a knockout even on steps that don't land the KO itself.
-DAMAGE_REWARD_PER_100 = 0.01
-
-# Reward per card drawn since the previous decision (turn-start draw, Hilda,
-# Lillie's Determination, or Dudunsparce's Run Away Draw all count the same
-# way here -- see _draw_count).
-DRAW_REWARD_PER_CARD = 0.005
-
-# Wally's Compassion (heal all damage from one Mega): a fixed -0.12 charge
-# plus 0.02 per 10 HP healed, breaking even around 60 HP healed and going
-# negative below that -- Wally costs the turn's Supporter, so it should only
-# come out ahead when it recovers real value (roughly a real attack's worth
-# of damage or more), not when topped off after a single chip hit. Sized so
-# this stays net-negative for a low-value heal even with SUPPORTER_PLAY_REWARD
-# stacked on top (see _supporter_played_count).
-WALLY_HEAL_BASE = -0.12
-WALLY_HEAL_PER_10HP = 0.02
-
-# Ignition Energy self-discards at end of turn, so attaching it and then
-# attacking with anything other than Nebula Beam wastes it.
-IGNITION_WASTE_PENALTY = 0.025
-
-# Crushing Hammer actually landing (opponent loses an attached Energy, i.e.
-# the coin flip hit) -- see _newly_discarded_ids.
-HAMMER_DISCARD_REWARD = 0.02
-
-# Small nudge to play Items while Budew is on the opponent's board.
-ITEM_VS_BUDEW_REWARD = 0.005
-
-# Boss's Orders pulling up a target our current board can actually punish:
-# either a 2+ prize target Jetting Blow (120 dmg) can now KO, or a tankier
-# target that needs Nebula Beam / a Mega Froslass ex attack (<=210) to finish.
-BOSS_MULTI_PRIZE_REWARD = 0.03
-BOSS_BIG_FINISH_REWARD = 0.03
-
-# Bench plan calls for 2-3 attackers (Staryu/Snorunt), never more than 4;
-# escalating penalty past that.
-BENCH_OVER_4_PENALTY = 0.05
-BENCH_OVER_5_PENALTY = 0.10
-
-# Matchup-specific evolution penalties.
-IONO_BELLIBOLT_EVOLVE_PENALTY = 0.5   # evolving into Mega Starmie ex vs Iono's Bellibolt ex
-ARCHALUDON_EVOLVE_PENALTY = 0.5       # evolving into Mega Froslass ex vs Archaludon ex, still 3+ prizes down
-
-# Ending our own turn (2nd turn onward) without having attacked.
-NO_ATTACK_PENALTY = 0.05
-
-# Resentful Refrain (50 x opponent's hand size) is weak when the opponent's
-# hand is small -- penalize firing it for <=100 (i.e. opponent's hand <=2)
-# on a step where Mega Starmie ex (Jetting Blow, generally the better play
-# then) is also available to attack instead.
-RESENTFUL_REFRAIN_LOW_VALUE_PENALTY = 0.025
-
-# Bonus for choosing Absolute Snow (150 dmg + Sleep) into a target that
-# Resentful Refrain's current damage (50 x opponent's hand) wouldn't have KO'd.
-ABSOLUTE_SNOW_HIGH_HP_REWARD = 0.02
-
-# Deck-out risk: reward using Run Away Draw (detected by Dudunsparce leaving
-# play under its own ability) specifically when our deck is already thin --
-# it's the one draw source in this deck that also replenishes deck size
-# (shuffles itself + attachments back in), so it's the correct out here.
-DECK_OUT_RISK_THRESHOLD = 10
-RUN_AWAY_DRAW_DECK_SAVE_REWARD = 0.03
-
-# Very small nudge to play the turn's Supporter at all -- including Wally's
-# Compassion, since WALLY_HEAL_BASE's magnitude is sized to stay net-negative
-# for a low-value heal even with this stacked on top.
-SUPPORTER_PLAY_REWARD = 0.005
-
-# Playing Risky Ruins; the bump bonus is additional, for specifically
-# replacing an opposing Stadium with it (only one Stadium is in play at once).
-STADIUM_PLAY_REWARD = 0.03
-STADIUM_BUMP_REWARD = 0.05
-
-
-# ── Card IDs (Staryu/Starmie/Snorunt/Froslass/Boss/Hammer/Ignition reused
-# verbatim from starmie_agent.py's ids, already verified there against
-# Card_ID_List_EN.pdf) plus optional ptcg.api access for everything this file
-# can't get from raw numeric IDs alone (attack IDs, opponent-only card IDs,
-# card types). Guarded the same way starmie_agent.py guards its `all_attack`
-# import -- if ptcg.api isn't importable from wherever this module loads,
-# every term below that depends on it just contributes 0 instead of raising.
-
-STARYU_ID = 1030
-STARMIE_ID = 1031      # Mega Starmie ex
-SNORUNT_ID = 103        # Snorunt (TWM printing; 860 is the ASC alt)
-FROSLASS_ID = 861       # Mega Froslass ex
-BOSS_ID = 1182          # Boss's Orders
-HAMMER_ID = 1120        # Crushing Hammer
-IGNITION_ID = 17        # Ignition Energy
-DUDUNSPARCE_ID = 66     # Dudunsparce (Run Away Draw)
-
-try:
-    from ptcg.api import all_card_data, CardType
-    CARD_DB = {c.cardId: c for c in all_card_data()}
-except Exception:
-    CardType = None
-    CARD_DB = {}
-
-
-def _nth_attack_id(card_id, n):
-    data = CARD_DB.get(card_id)
-    atks = list(getattr(data, "attacks", None) or []) if data else []
-    return atks[n] if n < len(atks) else None
-
-
-def _find_card_ids_by_name(*name_fragments):
-    """All CARD_DB ids whose name contains every fragment, case-insensitive
-    (covers alt-art reprints sharing one name). NOT verified against a live
-    observation or CARD_DB dump -- that CARD_DB entries even expose a `.name`
-    attribute is itself an assumption, unlike every other field this file
-    relies on. Print {CARD_DB[i].name for i in RESULT} to confirm the match
-    is the intended card before trusting it. Empty set (fails safe) if
-    CARD_DB is unavailable or nothing matches.
-    """
-    out = set()
-    for cid, data in CARD_DB.items():
-        name = (getattr(data, "name", "") or "").lower()
-        if all(frag.lower() in name for frag in name_fragments):
-            out.add(cid)
-    return out
-
-
-# Jetting Blow is Mega Starmie ex's printed 1st attack, Nebula Beam its 2nd --
-# same order starmie_agent.py resolves them in. None (term disabled) if
-# ptcg.api isn't importable here.
-NEBULA_BEAM_ID = _nth_attack_id(STARMIE_ID, 1)
-
-# Resentful Refrain is Mega Froslass ex's printed 1st attack, Absolute Snow
-# its 2nd -- same resolution as NEBULA_BEAM_ID above.
-RESENTFUL_REFRAIN_ID = _nth_attack_id(FROSLASS_ID, 0)
-ABSOLUTE_SNOW_ID = _nth_attack_id(FROSLASS_ID, 1)
-
-# Opponent-only cards with no verified numeric ID available to this file --
-# resolved by name match instead. Confirm before relying on these.
-BUDEW_IDS = _find_card_ids_by_name("budew")
-IONO_BELLIBOLT_IDS = _find_card_ids_by_name("iono", "bellibolt")
-ARCHALUDON_IDS = _find_card_ids_by_name("archaludon")
-
-
-def _prizes_remaining(obs_dict, player_index):
-    players = (obs_dict.get("current") or {}).get("players") or [{}, {}]
-    if player_index < len(players):
-        return len(players[player_index].get("prize") or [])
-    return 0
-
-
-def _evolve_count(obs_dict, player_index):
-    """Count Evolve events attributed to player_index since the previous decision.
-
-    Verified against real obs["logs"] dumps (vis.json): Evolve entries have
-    fields {type, playerIndex, cardId, cardIdTarget, serial, serialTarget},
-    matching this function's assumption exactly.
-    """
-    count = 0
-    for entry in obs_dict.get("logs") or []:
-        if (
-            isinstance(entry, dict)
-            and entry.get("type") == "Evolve"
-            and entry.get("playerIndex") == player_index
-        ):
-            count += 1
-    return count
-
-
-def _energy_attach_count(obs_dict, player_index):
-    """Count energy-Attach events by player_index since the previous decision.
-
-    Verified against real obs["logs"] dumps (vis.json): Attach entries have
-    fields {type, playerIndex, cardId, serial, cardIdTarget, serialTarget} --
-    there is no separate energyIndex/toolIndex field, and tool attaches (e.g.
-    Lucky Helmet) use the exact same shape as energy attaches. The only way
-    to tell them apart is the attached card's own type, so this checks
-    _is_energy_card(cardId) instead. Needs CARD_DB to distinguish energy from
-    tool; contributes 0 (fails safe) if CARD_DB is unavailable, same as the
-    other CARD_DB-dependent helpers below.
-    """
-    count = 0
-    for entry in obs_dict.get("logs") or []:
-        if (
-            isinstance(entry, dict)
-            and entry.get("type") == "Attach"
-            and entry.get("playerIndex") == player_index
-            and _is_energy_card(entry.get("cardId"))
-        ):
-            count += 1
-    return count
-
-
-def _damage_dealt(obs_dict, target_player_index):
-    """Sum HP lost by target_player_index's Pokemon (active + bench) since the
-    previous decision, from HpChange log entries.
-
-    Verified against real obs["logs"] dumps (vis.json) by tracing a Pokemon's
-    "hp" field across consecutive states against its HpChange entries: fields
-    are {"type": "HpChange", "playerIndex": <whose Pokemon changed>, "cardId",
-    "serial", "value": <signed HP delta>, "putDamageCounter": <bool>} -- there
-    is no separate isRecover field. "value" is the exact signed delta applied
-    to hp (negative for damage, positive for healing); putDamageCounter marks
-    whether the engine applied this particular delta as a 10-HP counter step
-    vs a direct HP set and doesn't affect which entries count as damage.
-    Deliberately doesn't filter by inPlayArea so bench damage (splash/spread
-    attacks) counts same as active damage.
-    """
-    total = 0
-    for entry in obs_dict.get("logs") or []:
-        if not (
-            isinstance(entry, dict)
-            and entry.get("type") == "HpChange"
-            and entry.get("playerIndex") == target_player_index
-        ):
-            continue
-        value = entry.get("value")
-        if isinstance(value, (int, float)) and value < 0:
-            total += -value
-    return total
-
-
-# ── Shared board/discard accessors ──
-
-def _players(obs_dict):
-    return (obs_dict.get("current") or {}).get("players") or [{}, {}]
-
-
-def _pokemon_in_play(obs_dict, player_index):
-    players = _players(obs_dict)
-    if player_index >= len(players):
-        return []
-    p = players[player_index] or {}
-    return [m for m in (list(p.get("active") or []) + list(p.get("bench") or [])) if m]
-
-
-def _active_pokemon(obs_dict, player_index):
-    players = _players(obs_dict)
-    if player_index >= len(players):
-        return None
-    act = (players[player_index] or {}).get("active") or []
-    return act[0] if act else None
-
-
-def _count_in_play(obs_dict, player_index, card_id):
-    return sum(1 for m in _pokemon_in_play(obs_dict, player_index) if m.get("id") == card_id)
-
-
-def _opponent_has_any(obs_dict, card_ids, opp_index):
-    if not card_ids:
-        return False
-    return any(m.get("id") in card_ids for m in _pokemon_in_play(obs_dict, opp_index))
-
-
-def _newly_discarded_ids(prev_obs, cur_obs, player_index):
-    """Card ids that entered player_index's discard pile since prev_obs, as a
-    flat list (duplicates included). A count-based (not positional) diff, so
-    it doesn't assume discard-pile ordering -- and it's a materially more
-    solid way to detect "was card X played" than guessing a "Play" log-event
-    schema would be, since it only relies on the `discard` zone list already
-    used throughout starmie_agent.py (ps.discard). It will also fire on
-    non-"play" discards (e.g. a cost paid to search with an Item), which is
-    an accepted approximation, not a schema guess.
-    """
-    prev_players, cur_players = _players(prev_obs), _players(cur_obs)
-    if player_index >= len(prev_players) or player_index >= len(cur_players):
-        return []
-    prev_ids = Counter(c.get("id") for c in ((prev_players[player_index] or {}).get("discard") or []) if c)
-    cur_ids = Counter(c.get("id") for c in ((cur_players[player_index] or {}).get("discard") or []) if c)
-    new_ids = []
-    for cid, cnt in cur_ids.items():
-        new_ids.extend([cid] * max(0, cnt - prev_ids.get(cid, 0)))
-    return new_ids
-
-
-def _is_energy_card(card_id):
-    if not CARD_DB or CardType is None or card_id is None:
-        return None
-    data = CARD_DB.get(card_id)
-    ct = getattr(data, "cardType", None) if data else None
-    if ct is None:
-        return None
-    return ct in (getattr(CardType, "ENERGY", object()), getattr(CardType, "SPECIAL_ENERGY", object()))
-
-
-def _is_item_card(card_id):
-    if not CARD_DB or CardType is None or card_id is None:
-        return None
-    data = CARD_DB.get(card_id)
-    ct = getattr(data, "cardType", None) if data else None
-    return None if ct is None else ct == getattr(CardType, "ITEM", None)
-
-
-def _prize_value_by_id(card_id):
-    if not CARD_DB or card_id is None:
-        return 1
-    data = CARD_DB.get(card_id)
-    if data and getattr(data, "megaEx", False):
-        return 3
-    if data and getattr(data, "ex", False):
-        return 2
-    return 1
-
-
-# ── New shaping-term helpers ──
-
-def _draw_count(obs_dict, player_index):
-    """Cards drawn by player_index since the previous decision, from Draw log
-    entries. Verified against real obs["logs"] dumps (vis.json): Draw entries
-    have fields {type, playerIndex, cardId, serial} -- one entry per card
-    drawn, with no count/amount field, so multi-card draws (e.g. Run Away
-    Draw's "draw 3") show up as multiple entries. The count/amount fallback
-    below is kept in case some draw effect ever emits a batched entry, but
-    every entry observed so far is single-card.
-    """
-    total = 0
-    for entry in obs_dict.get("logs") or []:
-        if not (isinstance(entry, dict) and entry.get("type") == "Draw"
-                and entry.get("playerIndex") == player_index):
-            continue
-        amount = entry.get("count", entry.get("amount"))
-        total += amount if isinstance(amount, (int, float)) else 1
-    return total
-
-
-def _heal_dealt(obs_dict, player_index):
-    """HP healed on player_index's own Pokemon since the previous decision --
-    the mirror image of _damage_dealt's negative-value branch (see there for
-    the vis.json verification of the HpChange schema: positive "value" is a
-    heal, there is no isRecover field)."""
-    total = 0
-    for entry in obs_dict.get("logs") or []:
-        if not (isinstance(entry, dict) and entry.get("type") == "HpChange"
-                and entry.get("playerIndex") == player_index):
-            continue
-        value = entry.get("value")
-        if isinstance(value, (int, float)) and value > 0:
-            total += value
-    return total
-
-
-def _active_has_ignition(obs_dict, player_index):
-    mon = _active_pokemon(obs_dict, player_index)
-    if not mon:
-        return False
-    return any(isinstance(c, dict) and c.get("id") == IGNITION_ID
-               for c in (mon.get("energyCards") or []))
-
-
-def _attack_id_used(obs_dict, player_index):
-    """attackId of an Attack log entry taken by player_index this step, if
-    any (None otherwise). "attackId"/"playerIndex" on Attack entries are
-    trusted -- starmie_agent.py already reads LogType.ATTACK's .attackId
-    directly (its Itchy Pollen check). The "Attack" string spelling of that
-    enum's raw value is inferred the same way as the other type-name guesses
-    in this file, not independently confirmed.
-    """
-    for entry in obs_dict.get("logs") or []:
-        if (isinstance(entry, dict) and entry.get("type") == "Attack"
-                and entry.get("playerIndex") == player_index):
-            return entry.get("attackId")
-    return None
-
-
-def _items_played_count(prev_obs, cur_obs, player_index):
-    return sum(1 for cid in _newly_discarded_ids(prev_obs, cur_obs, player_index) if _is_item_card(cid))
-
-
-def _boss_setup_reward(prev_obs, cur_obs, me_index, opp_index):
-    """Bonus for a Boss's Orders (detected via _newly_discarded_ids, not a
-    guessed log event) that pulls up either a 2+ prize target Jetting Blow
-    (120 dmg) can now finish, or a tankier target within Nebula Beam / Mega
-    Froslass ex attack range (<=210). This is the roughest approximation
-    added in this file: it reads the post-effect board only (no true credit
-    assignment to whichever later attack actually lands the KO, which may
-    happen on a different decision step), ignores weakness/resistance on the
-    120 threshold, and _prize_value_by_id needs CARD_DB (defaults every
-    unknown target to 1 prize if that's unavailable).
-    """
-    if BOSS_ID not in _newly_discarded_ids(prev_obs, cur_obs, me_index):
-        return 0.0
-    target = _active_pokemon(cur_obs, opp_index)
-    if not target:
-        return 0.0
-    remaining_hp = target.get("hp")
-    if not isinstance(remaining_hp, (int, float)):
-        return 0.0
-    if remaining_hp <= 120 and _prize_value_by_id(target.get("id")) >= 2:
-        return BOSS_MULTI_PRIZE_REWARD
-    if 120 < remaining_hp <= 210:
-        return BOSS_BIG_FINISH_REWARD
-    return 0.0
-
-
-_turns_taken = {0: 0, 1: 0}
-
-
-def reset_turn_tracking():
-    """Call at the start of every new game (both self-play and
-    heuristic-opponent mode) -- see _no_attack_turn_penalty."""
-    global _turns_taken
-    _turns_taken = {0: 0, 1: 0}
-
-
-def _no_attack_turn_penalty(prev_obs, cur_obs, me_index):
-    """Penalize ending our own turn (turn control passing to the opponent)
-    without attacking, from our 2nd turn onward. Turn-passing is read off
-    current.yourIndex flipping between prev_obs and cur_obs -- the same field
-    this module already keys "me" off of, so more solidly grounded than a
-    guessed log-event name, but it still assumes every yourIndex flip is a
-    full turn change (not, say, a mid-turn prompt directed at the opponent)
-    and that an Attack log entry always appears in the flipping step's delta
-    when we do attack (matches the "attack ends the turn" rule noted in
-    starmie_agent.py's score-priority comment).
-
-    Needs per-player state across steps -- this can't be answered from one
-    (prev_obs, cur_obs) pair alone. Only correct for one game running in this
-    process at a time; reset_turn_tracking() must be called on every new
-    game, and this will misbehave if multiple games run concurrently through
-    a shared process without keying the state by game/env id.
-    """
-    cur_mover = (cur_obs.get("current") or {}).get("yourIndex")
-    if cur_mover == me_index:
-        return 0.0
-    _turns_taken[me_index] = _turns_taken.get(me_index, 0) + 1
-    attacked = any(
-        isinstance(e, dict) and e.get("type") == "Attack" and e.get("playerIndex") == me_index
-        for e in (cur_obs.get("logs") or [])
+import os
+import time
+from datetime import timedelta
+
+import torch
+from sb3_contrib import MaskablePPO
+from sb3_contrib.common.wrappers import ActionMasker
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import SubprocVecEnv
+
+from training.cabt_env import DECK_PATH, POLICY_NET_ARCH, CabtEnv
+from training.callbacks import RewardTermCallback, SnapshotCallback, WinRateCallback
+from training.league import SnapshotOpponentPool
+
+from heuristics.crustle_agent import agent as crustle_agent
+from heuristics.abomasnow_agent import agent as abomasnow_agent
+from heuristics.dragapult_agent import agent as dragapult_agent
+from heuristics.dragapult_v2_agent import agent as dragapult_v2_agent
+from heuristics.iono_agent import agent as iono_agent
+from heuristics.archaludon_agent import agent as archaludon_agent
+from heuristics.alakazam_agent import agent as alakazam_agent
+from heuristics.starmie_agent import agent as starmie_agent
+
+
+def _load_deck(path):
+    with open(path) as f:
+        deck = [int(x) for x in f.read().splitlines() if x.strip()]
+    if len(deck) != 60:
+        raise ValueError(f"{path} must contain 60 cards, got {len(deck)}")
+    return deck
+
+
+# Heuristic opponent pool: one is drawn at random each episode (see CabtEnv).
+# Each entry is (name, agent_fn, deck) and the opponent pilots its OWN deck --
+# a heuristic piloting a foreign deck wouldn't exercise the strategy it was
+# written for. The learner always plays the CabtEnv DECK_PATH deck.
+OPPONENT_POOL = [
+    ("crustle", crustle_agent, _load_deck("heuristics/crustle_agent/crustle_deck.csv")),
+    ("abomasnow", abomasnow_agent, _load_deck("heuristics/abomasnow_agent/deck.csv")),
+    ("dragapult", dragapult_agent, _load_deck("heuristics/dragapult_agent/deck.csv")),
+    (
+        "dragapult_v2",
+        dragapult_v2_agent,
+        _load_deck("heuristics/dragapult_v2_agent/deck.csv"),
+    ),
+    ("iono", iono_agent, _load_deck("heuristics/iono_agent/deck.csv")),
+    (
+        "archaludon",
+        archaludon_agent,
+        _load_deck("heuristics/archaludon_agent/deck.csv"),
+    ),
+    # ragingbolt is excluded for now: its discard logic is buggy (returns 2
+    # picks on "discard exactly 3", IndexError on some board states), so it
+    # plays artificially weak and inflates win rates. Re-add once fixed.
+    ("alakazam", alakazam_agent, _load_deck("heuristics/alakazam_agent/deck.csv")),
+    ("starmie", starmie_agent, _load_deck("heuristics/starmie_agent/deck.csv")),
+]
+
+# Which device MaskablePPO trains the policy/value networks on. Defaults to
+# "cpu" -- measured on this repo (see the DEVICE=cuda vs DEVICE=cpu smoke
+# test in conversation/PR history), "cuda" is 8x+ SLOWER here despite a real
+# GPU being available, because rollout collection calls the policy once per
+# env step (thousands of tiny sequential forward passes to pick each
+# action), and per-call CUDA kernel-launch/sync overhead (especially bad
+# under Windows' WDDM driver model) dwarfs the actual compute for a network
+# this small (MlpPolicy's default 64x64 layers). GPU would only help if the
+# network were much bigger or rollout collection were batched, neither of
+# which is true here. Override via the DEVICE env var, e.g. `DEVICE=cuda
+# python -m training.train`, if that ever changes -- N_ENVS/BATCH_SIZE/
+# N_EPOCHS below scale themselves to whichever device is chosen. Only
+# affects where the neural net does its forward/backward passes -- the
+# N_ENVS game-engine workers below always run on CPU regardless.
+DEVICE = os.environ.get("DEVICE", "cpu")
+if DEVICE == "cuda" and not torch.cuda.is_available():
+    print("DEVICE=cuda requested but no CUDA GPU is available; falling back to cpu.")
+    DEVICE = "cpu"
+
+# Two hyperparameter profiles, selected by DEVICE. CPU is this repo's
+# original, proven configuration -- unchanged. CUDA is a separate profile
+# for when the policy/value networks grow enough (more/wider layers, a
+# CNN/LSTM feature extractor, etc.) for a GPU to actually win: bigger
+# batch_size and n_epochs so a GPU update pass gets large, dense matmuls,
+# one less CPU core reserved for the game-engine workers since the main
+# process's own compute moves to the GPU, and policy_kwargs as the hook for
+# a larger net_arch once the model itself grows. It is NOT yet a proven win
+# -- see the DEVICE comment above for the measured 8x+ slowdown on today's
+# tiny MlpPolicy -- this profile exists so switching DEVICE="cuda" is a
+# single flag flip once the model is heavy enough to justify it, instead of
+# a re-tune at that point.
+_CPU_PROFILE = dict(reserved_cores=2, batch_size=256, n_epochs=4, policy_kwargs=None)
+_GPU_PROFILE = dict(
+    reserved_cores=1,
+    batch_size=2048,
+    n_epochs=15,
+    policy_kwargs=None,  # e.g. dict(net_arch=[256, 256]) once the model grows
+)
+_profile = _GPU_PROFILE if DEVICE == "cuda" else _CPU_PROFILE
+
+# Each worker runs the native game engine in its own OS process, since
+# Battle.battle_ptr in ptcg/sim.py is global mutable state shared within a
+# process -- multiple envs in one process would clobber each other's battle.
+# Worker count is a CPU-bound decision (each worker is one OS process
+# stepping the native engine) -- it scales with cores on whatever machine
+# this runs on, minus reserved_cores (see profiles above) for the OS and
+# (on CPU) the main process's own policy forward/backward passes. Override
+# via the N_ENVS env var if you want a fixed count instead.
+N_ENVS = int(
+    os.environ.get("N_ENVS", max(1, (os.cpu_count() or 4) - _profile["reserved_cores"]))
+)
+
+# League self-play: SnapshotCallback freezes the live policy into
+# SNAPSHOT_DIR every SNAPSHOT_FREQ timesteps (plus once at training start),
+# keeping the newest MAX_SNAPSHOTS; league envs draw a random frozen snapshot
+# each episode (mirror match on the learner's deck). Unlike the old pure
+# self-play envs -- where both sides fed one rollout stream and GAE
+# bootstrapped values across perspective flips -- every league transition is
+# the learner's own, so the PPO update is correct, and playing recent past
+# selves still gives self-play curriculum (win_rate/league ~50% is healthy).
+SNAPSHOT_DIR = "./league_snapshots"
+SNAPSHOT_FREQ = 100_000
+MAX_SNAPSHOTS = 5
+TENSORBOARD_LOG_DIR = os.path.abspath("./ppo_cabt_logs")
+os.makedirs(TENSORBOARD_LOG_DIR, exist_ok=True)
+
+# Split workers between league self-play (vs frozen snapshots, see above) and
+# a heuristic opponent (directly optimizes for beating the known baselines --
+# a random one from OPPONENT_POOL each episode). Must sum to N_ENVS. League
+# gets a bigger share than the old pure self-play split (1/6) since its
+# gradients are now correct; tune if heuristic win rates stall.
+N_LEAGUE_ENVS = N_ENVS // 4
+N_HEURISTIC_ENVS = N_ENVS - N_LEAGUE_ENVS
+
+# 2048 steps/env is the standard PPO rollout length, so total buffer size
+# scales with N_ENVS instead of being held constant.
+TARGET_SAMPLES_PER_UPDATE = 2048 * N_ENVS
+N_STEPS = max(TARGET_SAMPLES_PER_UPDATE // N_ENVS, 1)
+
+# Minibatch size for each gradient step, and passes over each rollout
+# buffer per update -- both overridable via env vars regardless of profile.
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", _profile["batch_size"]))
+N_EPOCHS = int(os.environ.get("N_EPOCHS", _profile["n_epochs"]))
+# Warm-starting from bc.py requires the PPO model to have the SAME architecture
+# the BC model used (load_state_dict is strict), so default both profiles to
+# the shared POLICY_NET_ARCH unless a profile explicitly pins its own kwargs.
+POLICY_KWARGS = _profile["policy_kwargs"] or dict(net_arch=list(POLICY_NET_ARCH))
+
+# Learning-rate schedule: start high so early updates move the policy off its
+# random/BC init quickly, then decay to a floor so late training refines
+# instead of thrashing (a constant 1e-4 does neither well over 30M steps).
+# Decays linearly from LR_START to LR_END over the first LR_DECAY_FRAC of
+# training, then holds LR_END flat for the remainder -- the "bottoming out".
+LR_START = float(os.environ.get("LR_START", 1e-4))
+LR_END = float(os.environ.get("LR_END", 3e-5))
+LR_DECAY_FRAC = float(os.environ.get("LR_DECAY_FRAC", 0.8))
+
+
+def linear_decay_to_floor(start: float, end: float, decay_frac: float):
+    """SB3 schedule: takes progress_remaining (1.0 at start -> 0.0 at end)."""
+
+    def schedule(progress_remaining: float) -> float:
+        progress = 1.0 - progress_remaining  # 0.0 -> 1.0 as training advances
+        if decay_frac <= 0:
+            return end
+        frac = min(progress / decay_frac, 1.0)
+        return start + frac * (end - start)
+
+    return schedule
+
+
+def mask_fn(env):
+    return env.action_masks()
+
+
+def make_league_env():
+    # The pool is a callable, re-scanned each episode, so snapshots saved
+    # mid-run join the league. Snapshots pilot the learner's own deck: a
+    # mirror match, which is also what they were trained on. Until the first
+    # snapshot lands (SB3 resets the envs before on_training_start fires, so
+    # this worker's first episode always predates it) the pool falls back to
+    # the heuristics rather than to pure self-play -- see SnapshotOpponentPool.
+    env = CabtEnv(
+        opponent_agents=SnapshotOpponentPool(
+            SNAPSHOT_DIR, _load_deck(DECK_PATH), fallback=OPPONENT_POOL
+        )
     )
-    if _turns_taken[me_index] >= 2 and not attacked:
-        return NO_ATTACK_PENALTY
-    return 0.0
+    env = ActionMasker(env, mask_fn)
+    # info_keywords lifts CabtEnv's per-episode "opponent" tag into
+    # info["episode"] so WinRateCallback can read it.
+    env = Monitor(env, info_keywords=("opponent",))
+    return env
 
 
-# ── Follow-up shaping-term helpers ──
-
-def _hand_size(obs_dict, player_index):
-    players = _players(obs_dict)
-    if player_index >= len(players):
-        return 0
-    return len((players[player_index] or {}).get("hand") or [])
+def make_heuristic_env():
+    env = CabtEnv(opponent_agents=OPPONENT_POOL)
+    env = ActionMasker(env, mask_fn)
+    env = Monitor(env, info_keywords=("opponent",))
+    return env
 
 
-def _deck_remaining(obs_dict, player_index):
-    """Same list-length-as-count convention as _prizes_remaining (deck
-    contents are hidden too, but the count is public in real TCG rules)."""
-    players = _players(obs_dict)
-    if player_index >= len(players):
-        return 0
-    return len((players[player_index] or {}).get("deck") or [])
-
-
-def _mega_starmie_available(obs_dict, player_index):
-    """Mega Starmie ex in play (active or bench) with at least 1 Energy
-    attached -- able to Jetting Blow this turn. Mirrors starmie_agent.py's
-    bench_ready_mega check."""
-    return any(
-        m.get("id") == STARMIE_ID and len(m.get("energyCards") or []) >= 1
-        for m in _pokemon_in_play(obs_dict, player_index)
+if __name__ == "__main__":
+    # Built FIRST, before the envs: its constructor clears SNAPSHOT_DIR so
+    # this run's league is its own, and SubprocVecEnv workers glob that
+    # directory from their very first reset (which SB3 performs before any
+    # callback hook runs). Constructing it later would let those first
+    # episodes draw the previous run's snapshots.
+    snapshot_cb = SnapshotCallback(
+        SNAPSHOT_DIR, SNAPSHOT_FREQ, max_snapshots=MAX_SNAPSHOTS, verbose=1
     )
 
+    env_fns = [make_league_env] * N_LEAGUE_ENVS + [
+        make_heuristic_env
+    ] * N_HEURISTIC_ENVS
+    env = SubprocVecEnv(env_fns)
 
-def _is_supporter_card(card_id):
-    if not CARD_DB or CardType is None or card_id is None:
-        return None
-    data = CARD_DB.get(card_id)
-    ct = getattr(data, "cardType", None) if data else None
-    return None if ct is None else ct == getattr(CardType, "SUPPORTER", None)
-
-
-def _supporter_played_count(prev_obs, cur_obs, player_index):
-    """Supporters played this step, Wally's Compassion included -- see
-    WALLY_HEAL_BASE for why that's fine (its magnitude already keeps a
-    low-value heal net-negative with this bonus stacked on top)."""
-    return sum(
-        1 for cid in _newly_discarded_ids(prev_obs, cur_obs, player_index)
-        if _is_supporter_card(cid)
+    print(f"Training on device: {DEVICE}")
+    print(
+        f"LR schedule: {LR_START:.1e} -> {LR_END:.1e} over the first "
+        f"{LR_DECAY_FRAC:.0%} of training, then flat"
     )
 
-
-def _stadium_identity(obs_dict):
-    """(cardId, ownerPlayerIndex) of the Stadium currently in play, or None.
-    Reads obs["current"]["stadium"] + each entry's playerIndex, the same
-    zone/field starmie_agent.py's deck_counts() already reads -- though that
-    function accesses playerIndex via a defensive getattr(..., fallback), so
-    treat its presence here as likely but not fully confirmed."""
-    stadium = (obs_dict.get("current") or {}).get("stadium") or []
-    s = stadium[0] if stadium else None
-    return (s.get("id"), s.get("playerIndex")) if s else None
-
-
-def reward_terms(prev_obs, cur_obs, done, result, me_index):
-    """Named breakdown of compute_reward's terms, keyed for per-component
-    logging (e.g. TensorBoard reward/<key> series) -- see compute_reward for
-    the single-value entry point callers that don't need the breakdown
-    should use instead.
-
-    Args/Returns semantics match compute_reward, except a terminal step
-    returns a single {"terminal": +-1.0} entry instead of the full shaping
-    breakdown (there's nothing to shape once the game is over).
-    """
-    if done:
-        return {"terminal": 1.0 if result == me_index else -1.0}
-
-    opp_index = 1 - me_index
-    my_took = max(
-        0,
-        _prizes_remaining(prev_obs, me_index)
-        - _prizes_remaining(cur_obs, me_index),
-    )
-    opp_took = max(
-        0,
-        _prizes_remaining(prev_obs, opp_index)
-        - _prizes_remaining(cur_obs, opp_index),
+    model = MaskablePPO(
+        "MlpPolicy",
+        env,
+        verbose=1,
+        device=DEVICE,
+        learning_rate=linear_decay_to_floor(LR_START, LR_END, LR_DECAY_FRAC),
+        n_steps=N_STEPS,  # N_STEPS * N_ENVS ~= TARGET_SAMPLES_PER_UPDATE
+        batch_size=BATCH_SIZE,
+        n_epochs=N_EPOCHS,
+        policy_kwargs=POLICY_KWARGS,
+        gamma=0.995,
+        # SB3's default is 0.0; a small entropy bonus keeps the policy
+        # exploring instead of collapsing onto one action pattern early.
+        ent_coef=0.01,
+        tensorboard_log=TENSORBOARD_LOG_DIR,
     )
 
-    my_prize_reward = PRIZE_REWARD * my_took
-    if my_took >= 2:
-        my_prize_reward *= MULTI_PRIZE_MULTIPLIER
-    opp_prize_reward = PRIZE_REWARD * opp_took
+    # Warm start: BC_INIT=<path.zip> copies the policy weights (actor AND
+    # value head) out of a behavior-cloned model (training/bc.py) so PPO
+    # starts from "imitates the starmie heuristic" instead of random. Only
+    # the network weights are taken -- optimizer state and PPO hyperparams
+    # stay fresh from the model built above. The initial league snapshot
+    # (SnapshotCallback at training start) then captures the BC policy too.
+    bc_init = os.environ.get("BC_INIT")
+    if bc_init:
+        from stable_baselines3.common.save_util import load_from_zip_file
 
-    evolve_reward = EVOLVE_REWARD * _evolve_count(cur_obs, me_index)
-    energy_reward = ENERGY_ATTACH_REWARD * _energy_attach_count(cur_obs, me_index)
-    damage_reward = DAMAGE_REWARD_PER_100 * (_damage_dealt(cur_obs, opp_index) / 100)
+        _, params, _ = load_from_zip_file(bc_init, device=DEVICE)
+        model.policy.load_state_dict(params["policy"])
+        print(f"Warm-started policy from {bc_init}")
 
-    draw_reward = DRAW_REWARD_PER_CARD * _draw_count(cur_obs, me_index)
+    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 15_000_000))
+    win_rate_cb = WinRateCallback()  # snapshot_cb was built above, before the envs
+    reward_term_cb = RewardTermCallback()
 
-    healed = _heal_dealt(cur_obs, me_index)
-    wally_reward = (WALLY_HEAL_BASE + WALLY_HEAL_PER_10HP * (healed / 10)) if healed > 0 else 0.0
+    start = time.perf_counter()
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[win_rate_cb, reward_term_cb, snapshot_cb],
+    )
+    elapsed = time.perf_counter() - start
 
-    used_attack = _attack_id_used(cur_obs, me_index)
+    model_name = "ppo_starmie_v16"
+    model.save(model_name)
 
-    ignition_penalty = 0.0
-    if used_attack is not None and _active_has_ignition(prev_obs, me_index):
-        if NEBULA_BEAM_ID is not None and used_attack != NEBULA_BEAM_ID:
-            ignition_penalty = IGNITION_WASTE_PENALTY
+    # ---- End-of-training report -------------------------------------------
+    steps_done = model.num_timesteps
+    avg_fps = steps_done / elapsed if elapsed > 0 else float("nan")
 
-    froslass_attack_penalty = 0.0
-    froslass_attack_bonus = 0.0
-    if used_attack is not None and used_attack in (RESENTFUL_REFRAIN_ID, ABSOLUTE_SNOW_ID):
-        refrain_damage = 50 * _hand_size(prev_obs, opp_index)
-        if used_attack == RESENTFUL_REFRAIN_ID:
-            if refrain_damage <= 100 and _mega_starmie_available(prev_obs, me_index):
-                froslass_attack_penalty = RESENTFUL_REFRAIN_LOW_VALUE_PENALTY
-        elif used_attack == ABSOLUTE_SNOW_ID:
-            snow_target = _active_pokemon(prev_obs, opp_index)
-            target_hp = snow_target.get("hp") if snow_target else None
-            if isinstance(target_hp, (int, float)) and target_hp > refrain_damage:
-                froslass_attack_bonus = ABSOLUTE_SNOW_HIGH_HP_REWARD
+    summary = win_rate_cb.summary()
+    # "overall" now covers the heuristic opponents only, so it undercounts the
+    # episodes actually played -- sum the per-opponent entries for the total.
+    total_games = sum(g for name, (_, g) in summary.items() if name != "overall")
 
-    deck_save_reward = 0.0
-    if _deck_remaining(prev_obs, me_index) <= DECK_OUT_RISK_THRESHOLD:
-        ran_away = (_count_in_play(prev_obs, me_index, DUDUNSPARCE_ID)
-                    > _count_in_play(cur_obs, me_index, DUDUNSPARCE_ID))
-        if ran_away:
-            deck_save_reward = RUN_AWAY_DRAW_DECK_SAVE_REWARD
+    print("\n" + "=" * 60)
+    print("TRAINING REPORT")
+    print("=" * 60)
+    print(f"Device               : {DEVICE}")
+    print(f"Parallel envs        : {N_ENVS}")
+    print(
+        f"Learning rate        : {LR_START:.1e} -> {LR_END:.1e} "
+        f"(linear over first {LR_DECAY_FRAC:.0%}, then flat)"
+    )
+    print(f"Timesteps            : {steps_done:,} / {total_timesteps:,}")
+    print(f"Wall-clock time      : {timedelta(seconds=round(elapsed))} ({elapsed:.1f}s)")
+    print(f"Average FPS          : {avg_fps:,.0f} steps/s")
+    print(f"Per-env FPS          : {avg_fps / N_ENVS:,.0f} steps/s")
+    print(f"Episodes completed   : {total_games:,}")
+    if elapsed > 0:
+        print(f"Episodes/hour        : {total_games / elapsed * 3600:,.0f}")
 
-    supporter_reward = SUPPORTER_PLAY_REWARD * _supporter_played_count(prev_obs, cur_obs, me_index)
-
-    stadium_reward = 0.0
-    prev_stadium = _stadium_identity(prev_obs)
-    cur_stadium = _stadium_identity(cur_obs)
-    if cur_stadium is not None and cur_stadium[1] == me_index and cur_stadium != prev_stadium:
-        stadium_reward = STADIUM_PLAY_REWARD
-        if prev_stadium is not None and prev_stadium[1] == opp_index:
-            stadium_reward += STADIUM_BUMP_REWARD
-
-    hammer_played = HAMMER_ID in _newly_discarded_ids(prev_obs, cur_obs, me_index)
-    opp_energy_lost = any(_is_energy_card(cid) for cid in _newly_discarded_ids(prev_obs, cur_obs, opp_index))
-    hammer_reward = HAMMER_DISCARD_REWARD if (hammer_played and opp_energy_lost) else 0.0
-
-    budew_reward = 0.0
-    if BUDEW_IDS and _opponent_has_any(prev_obs, BUDEW_IDS, opp_index):
-        budew_reward = ITEM_VS_BUDEW_REWARD * _items_played_count(prev_obs, cur_obs, me_index)
-
-    boss_reward = _boss_setup_reward(prev_obs, cur_obs, me_index, opp_index)
-
-    basics_in_play = _count_in_play(cur_obs, me_index, STARYU_ID) + _count_in_play(cur_obs, me_index, SNORUNT_ID)
-    if basics_in_play > 5:
-        bench_penalty = BENCH_OVER_5_PENALTY
-    elif basics_in_play > 4:
-        bench_penalty = BENCH_OVER_4_PENALTY
-    else:
-        bench_penalty = 0.0
-
-    evolve_matchup_penalty = 0.0
-    starmie_evolved = _count_in_play(cur_obs, me_index, STARMIE_ID) > _count_in_play(prev_obs, me_index, STARMIE_ID)
-    froslass_evolved = _count_in_play(cur_obs, me_index, FROSLASS_ID) > _count_in_play(prev_obs, me_index, FROSLASS_ID)
-    if starmie_evolved and IONO_BELLIBOLT_IDS and _opponent_has_any(prev_obs, IONO_BELLIBOLT_IDS, opp_index):
-        evolve_matchup_penalty += IONO_BELLIBOLT_EVOLVE_PENALTY
-    if (froslass_evolved and ARCHALUDON_IDS and _opponent_has_any(prev_obs, ARCHALUDON_IDS, opp_index)
-            and _prizes_remaining(prev_obs, me_index) > 2):
-        evolve_matchup_penalty += ARCHALUDON_EVOLVE_PENALTY
-
-    no_attack_penalty = _no_attack_turn_penalty(prev_obs, cur_obs, me_index)
-
-    # Signed contributions -- penalties negated here so the total is a plain
-    # sum and each logged series reads with its true sign.
-    terms = {}
-    terms["prize_mine"] = my_prize_reward
-    terms["prize_opp"] = -opp_prize_reward
-    terms["evolve"] = evolve_reward
-    terms["energy_attach"] = energy_reward
-    terms["damage"] = damage_reward
-    terms["draw"] = draw_reward
-    terms["wally_heal"] = wally_reward
-    terms["ignition_waste"] = -ignition_penalty
-    terms["hammer"] = hammer_reward
-    terms["budew_item"] = budew_reward
-    terms["boss"] = boss_reward
-    terms["bench"] = -bench_penalty
-    terms["evolve_matchup"] = -evolve_matchup_penalty
-    terms["no_attack"] = -no_attack_penalty
-    # The Resentful Refrain penalty and the Absolute Snow bonus are mutually
-    # exclusive (each is 0 unless that attack was the one used), so they share
-    # one series rather than splitting into two mostly-empty ones.
-    terms["froslass_attack"] = froslass_attack_bonus - froslass_attack_penalty
-    terms["deck_save"] = deck_save_reward
-    terms["supporter"] = supporter_reward
-    terms["stadium"] = stadium_reward
-    return terms
-
-
-def compute_reward(prev_obs, cur_obs, done, result, me_index):
-    """Total reward from the acting player's perspective -- the sum of
-    reward_terms() (see it for the term list and the arguments).
-
-    Kept as the single-value entry point for callers that don't need the
-    breakdown. Callers that DO want both (CabtEnv, so it can ship the terms
-    out for TensorBoard) should call reward_terms() once and sum it rather
-    than calling both, since reward_terms() is not side-effect free.
-    """
-    return sum(reward_terms(prev_obs, cur_obs, done, result, me_index).values())
+    print("\nWin rate (career, cumulative over run):")
+    # Overall first, then per-opponent sorted worst matchup first. "league"
+    # appears among them but is excluded from overall (see WinRateCallback);
+    # it is a mirror match, so ~50% is the healthy reading, not a matchup score.
+    overall = summary.pop("overall", None)
+    if overall is not None:
+        w, g = overall
+        label = "overall (vs heuristics)"
+        print(f"  {label:<22}: {w / g:6.1%}  ({w:,}/{g:,})" if g else f"  {label}: n/a")
+    for name, (w, g) in sorted(summary.items(), key=lambda kv: kv[1][0] / kv[1][1] if kv[1][1] else 0):
+        if g:
+            print(f"  {name:<22}: {w / g:6.1%}  ({w:,}/{g:,})")
+    print("=" * 60)
+    print(f"Saved model to {model_name}.zip")
