@@ -8,7 +8,7 @@ from training.obs_vectorizer import (
     obs_to_vector,
     set_vectorizer_deck,
 )
-from training.rewards import reward_terms
+from training.rewards import reset_turn_tracking, reward_terms
 import numpy as np
 import gymnasium as gym
 
@@ -180,6 +180,10 @@ class CabtEnv(gym.Env):
         # Prize-belief features are always from the learner's perspective, so
         # the vectorizer deck is the learner's deck regardless of opponent.
         set_vectorizer_deck(learner_deck)
+        # rewards.py's no-attack term counts each side's turns across steps;
+        # without this the counter carries into the next episode and turn 1 of
+        # every game after the first loses its intended grace period.
+        reset_turn_tracking()
 
         # A callable pool is re-evaluated every episode so it can grow/shrink
         # mid-run (league snapshots); a plain list is used as-is.

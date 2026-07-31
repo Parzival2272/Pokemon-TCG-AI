@@ -30,11 +30,20 @@ card draw, Wally's Compassion healing, wasting an attached Ignition Energy on
 a non-Nebula-Beam attack, landing Crushing Hammer, playing Items while the
 opponent has Budew in play, Boss's Orders setting up a good KO, overfilling
 the attacker bench, two matchup-specific evolution penalties, and failing to
-attack on our 2nd turn or later. Several of these need card/attack IDs or
-log-event names this file has no way to verify from here -- each helper below
-documents its specific guess and fails safe (contributes 0) rather than
-raising if the real schema differs. Confirm the flagged ones against real
-obs["logs"]/obs["current"] dumps before trusting them in training.
+attack on our 2nd turn or later.
+
+Several of those terms were originally written against a GUESSED log/board
+schema and, as the flat-0.0 TensorBoard series for the v13 run showed, never
+fired once. The observation schema has since been read off ptcg/api.py
+(LogType, Log, Pokemon, PlayerState, CardData) and confirmed against live
+games; the corrections are documented on each helper. In particular: log
+`type` is an int enum value, not a name string; HP_CHANGE.value is signed
+(negative = damage) and has no isRecover field; ATTACH identifies the
+attached card by cardId, not an energyIndex; DRAW is one entry per card;
+PlayerState exposes handCount/deckCount rather than hand/deck lists (hand is
+None for the opponent); and CardType's basic-Energy member is BASIC_ENERGY.
+Helpers still fail safe (contribute 0) rather than raising when CARD_DB or
+ptcg isn't importable.
 """
 
 from collections import Counter
@@ -157,11 +166,27 @@ IGNITION_ID = 17        # Ignition Energy
 DUDUNSPARCE_ID = 66     # Dudunsparce (Run Away Draw)
 
 try:
-    from ptcg.api import all_card_data, CardType
+    from ptcg.api import all_card_data, CardType, LogType
     CARD_DB = {c.cardId: c for c in all_card_data()}
 except Exception:
     CardType = None
+    LogType = None
     CARD_DB = {}
+
+
+# Log event types. An obs["logs"] entry's "type" is the raw IntEnum VALUE (an
+# int like 16), never the member name -- so the string comparisons this file
+# used to make ("Evolve", "Attach", "HpChange", "Draw", "Attack") matched
+# nothing, ever, and every term derived from them contributed exactly 0.0 for
+# whole training runs. Verified against ptcg/api.py's LogType and a live game.
+# Falls back to the documented values so a missing ptcg import degrades the
+# same way the CARD_DB-dependent terms do rather than raising at import.
+LOG_TURN_END = int(LogType.TURN_END) if LogType else 3
+LOG_DRAW = int(LogType.DRAW) if LogType else 4
+LOG_ATTACH = int(LogType.ATTACH) if LogType else 11
+LOG_EVOLVE = int(LogType.EVOLVE) if LogType else 12
+LOG_ATTACK = int(LogType.ATTACK) if LogType else 15
+LOG_HP_CHANGE = int(LogType.HP_CHANGE) if LogType else 16
 
 
 def _nth_attack_id(card_id, n):
@@ -211,87 +236,68 @@ def _prizes_remaining(obs_dict, player_index):
     return 0
 
 
-def _evolve_count(obs_dict, player_index):
-    """Count Evolve events attributed to player_index since the previous decision.
+def _log_entries(obs_dict, log_type, player_index):
+    """Every log entry of `log_type` attributed to `player_index` in this
+    step's delta. obs["logs"] carries only the events since the previous
+    decision (verified: ~6 entries/step, not a growing game-long list), which
+    is what every caller below assumes.
 
-    NOTE: unlike the prize mechanic above, this is NOT verified against a live
-    observation -- I inferred the shape from strings in the compiled engine
-    (kaggle_environments' cabt/cg/libcg.so is a Linux binary I can't load or
-    run here to confirm). It assumes obs_dict["logs"] is a list of event dicts
-    including entries like {"type": "Evolve", "playerIndex": <int>, ...},
-    since "Evolve" appears among log-type-looking constants (alongside
-    "Retreat"/"Ability"/"Discard"/"Attach") and "playerIndex" appears among
-    per-event target fields in the binary's string table. Please confirm the
-    real field names against a printed obs["logs"] from an actual game (e.g.
-    trigger an evolution and inspect cur_obs["logs"]) and adjust this function
-    if they differ -- as written it fails safe (returns 0, no crash) rather
-    than raising if the schema doesn't match.
+    On EVOLVE/ATTACH/DRAW/ATTACK, playerIndex is the acting player; on
+    HP_CHANGE it is the OWNER of the Pokemon whose HP changed (verified
+    against the board: 667/667 entries whose serial was still in play matched
+    that owner).
     """
-    count = 0
-    for entry in obs_dict.get("logs") or []:
-        if (
-            isinstance(entry, dict)
-            and entry.get("type") == "Evolve"
-            and entry.get("playerIndex") == player_index
-        ):
-            count += 1
-    return count
+    return [
+        e
+        for e in (obs_dict.get("logs") or [])
+        if isinstance(e, dict)
+        and e.get("type") == log_type
+        and e.get("playerIndex") == player_index
+    ]
+
+
+def _evolve_count(obs_dict, player_index):
+    """Count EVOLVE events by player_index since the previous decision."""
+    return len(_log_entries(obs_dict, LOG_EVOLVE, player_index))
 
 
 def _energy_attach_count(obs_dict, player_index):
-    """Count energy-Attach events by player_index since the previous decision.
+    """Count energy attachments by player_index since the previous decision.
 
-    Same caveat as _evolve_count: inferred from the compiled engine's string
-    table, not verified against a live observation. "Attach" appears as a
-    log-type constant alongside "Evolve"/"Ability"/"Discard"/"Retreat", and
-    the string table separately lists both "energyIndex" and "toolIndex" as
-    per-event fields -- consistent with a single "Attach" type covering both
-    energy and tool attachment, disambiguated by which index field is set.
-    This only counts entries that look like an energy attach (energyIndex
-    present). Confirm against a real obs["logs"] and adjust if tool attaches
-    also set energyIndex, or if energy attaches turn out to use a different
-    type/field; as written it fails safe (returns 0) rather than raising if
-    the schema doesn't match.
+    One ATTACH type covers both Energy and Pokemon Tools, and the entry
+    identifies the attached card by cardId/serial (there is no energyIndex
+    field -- that was a guess, and its absence is why this term was dead), so
+    Energy is separated from Tools by looking cardId up in CARD_DB. Fails safe
+    to 0 if CARD_DB is unavailable, since _is_energy_card returns None then.
     """
-    count = 0
-    for entry in obs_dict.get("logs") or []:
-        if (
-            isinstance(entry, dict)
-            and entry.get("type") == "Attach"
-            and entry.get("playerIndex") == player_index
-            and entry.get("energyIndex") is not None
-        ):
-            count += 1
-    return count
+    return sum(
+        1
+        for e in _log_entries(obs_dict, LOG_ATTACH, player_index)
+        if _is_energy_card(e.get("cardId"))
+    )
 
 
 def _damage_dealt(obs_dict, target_player_index):
     """Sum HP lost by target_player_index's Pokemon (active + bench) since the
-    previous decision, from HpChange log entries.
+    previous decision, from HP_CHANGE log entries.
 
-    Same caveat as the other _*_count helpers: inferred from the compiled
-    engine's string table, not verified against a live observation. Assumes
-    obs_dict["logs"] entries look like {"type": "HpChange",
-    "playerIndex": <whose Pokemon changed>, "value": <magnitude>,
-    "isRecover": <bool>, ...}, since "HpChange", "value", and "isRecover" all
-    appear together in the string table. Deliberately doesn't filter by
-    inPlayArea so bench damage (splash/spread attacks) counts same as active
-    damage. Excludes entries where isRecover is true (healing). Confirm the
-    field names/signs against a real obs["logs"] and adjust if they differ;
-    fails safe (contributes 0) rather than raising on a schema mismatch.
+    HP_CHANGE.value is SIGNED -- negative is HP lost, positive is healing --
+    which the old string-matching version got backwards: it summed `value > 0`
+    as damage, so had its type check ever matched it would have paid the agent
+    for healing the opponent. Verified on live logs: the sign always tracks the
+    board's HP delta (never its negation), and healing entries are exactly the
+    positive ones.
+
+    `putDamageCounter` is deliberately ignored: it flags whether the change
+    came from the damage-counter mechanic and appears on BOTH damage and
+    heals, so it says nothing about direction. Bench damage counts the same as
+    active damage (spread attacks are real damage).
     """
     total = 0
-    for entry in obs_dict.get("logs") or []:
-        if not (
-            isinstance(entry, dict)
-            and entry.get("type") == "HpChange"
-            and entry.get("playerIndex") == target_player_index
-            and not entry.get("isRecover")
-        ):
-            continue
+    for entry in _log_entries(obs_dict, LOG_HP_CHANGE, target_player_index):
         value = entry.get("value")
-        if isinstance(value, (int, float)) and value > 0:
-            total += value
+        if isinstance(value, (int, float)) and value < 0:
+            total += -value
     return total
 
 
@@ -349,13 +355,21 @@ def _newly_discarded_ids(prev_obs, cur_obs, player_index):
 
 
 def _is_energy_card(card_id):
+    """True if card_id is an Energy card (basic or special).
+
+    The member is BASIC_ENERGY, not ENERGY: the old getattr(CardType,
+    "ENERGY", object()) fell back to a sentinel that matches nothing, so this
+    recognised only SPECIAL_ENERGY. That silently narrowed the live `hammer`
+    term to "Crushing Hammer discarded a special Energy", missing every basic
+    Energy it stripped.
+    """
     if not CARD_DB or CardType is None or card_id is None:
         return None
     data = CARD_DB.get(card_id)
     ct = getattr(data, "cardType", None) if data else None
     if ct is None:
         return None
-    return ct in (getattr(CardType, "ENERGY", object()), getattr(CardType, "SPECIAL_ENERGY", object()))
+    return ct in (CardType.BASIC_ENERGY, CardType.SPECIAL_ENERGY)
 
 
 def _is_item_card(card_id):
@@ -380,34 +394,24 @@ def _prize_value_by_id(card_id):
 # ── New shaping-term helpers ──
 
 def _draw_count(obs_dict, player_index):
-    """Cards drawn by player_index since the previous decision, from Draw log
-    entries. NOT verified against a live observation (same caveat tier as
-    _evolve_count/_energy_attach_count above) -- "Draw" is a guess at the log
-    type name, unconfirmed. If a single Draw entry represents multiple cards
-    (e.g. Run Away Draw's "draw 3"), a "count"/"amount" field is summed if
-    present, else each entry counts as 1 card. Fails safe (0) on a schema
-    mismatch rather than raising.
+    """Cards drawn by player_index since the previous decision.
+
+    The engine emits ONE DRAW entry per card (each carrying that card's
+    cardId/serial), so a multi-card draw like Run Away Draw's "draw 3" is
+    three entries -- there is no count/amount field to sum, which the previous
+    version speculatively looked for. The opponent's draws arrive as
+    DRAW_REVERSE (card hidden) and are correctly not counted here.
     """
-    total = 0
-    for entry in obs_dict.get("logs") or []:
-        if not (isinstance(entry, dict) and entry.get("type") == "Draw"
-                and entry.get("playerIndex") == player_index):
-            continue
-        amount = entry.get("count", entry.get("amount"))
-        total += amount if isinstance(amount, (int, float)) else 1
-    return total
+    return len(_log_entries(obs_dict, LOG_DRAW, player_index))
 
 
 def _heal_dealt(obs_dict, player_index):
     """HP healed on player_index's own Pokemon since the previous decision --
-    the mirror image of _damage_dealt's excluded isRecover branch, same
-    schema caveats apply."""
+    the positive-`value` mirror of _damage_dealt (see it for the sign
+    convention; there is no isRecover field on HP_CHANGE, that belongs to the
+    special-condition log types)."""
     total = 0
-    for entry in obs_dict.get("logs") or []:
-        if not (isinstance(entry, dict) and entry.get("type") == "HpChange"
-                and entry.get("playerIndex") == player_index
-                and entry.get("isRecover")):
-            continue
+    for entry in _log_entries(obs_dict, LOG_HP_CHANGE, player_index):
         value = entry.get("value")
         if isinstance(value, (int, float)) and value > 0:
             total += value
@@ -423,17 +427,10 @@ def _active_has_ignition(obs_dict, player_index):
 
 
 def _attack_id_used(obs_dict, player_index):
-    """attackId of an Attack log entry taken by player_index this step, if
-    any (None otherwise). "attackId"/"playerIndex" on Attack entries are
-    trusted -- starmie_agent.py already reads LogType.ATTACK's .attackId
-    directly (its Itchy Pollen check). The "Attack" string spelling of that
-    enum's raw value is inferred the same way as the other type-name guesses
-    in this file, not independently confirmed.
-    """
-    for entry in obs_dict.get("logs") or []:
-        if (isinstance(entry, dict) and entry.get("type") == "Attack"
-                and entry.get("playerIndex") == player_index):
-            return entry.get("attackId")
+    """attackId of an ATTACK log entry taken by player_index this step, if any
+    (None otherwise)."""
+    for entry in _log_entries(obs_dict, LOG_ATTACK, player_index):
+        return entry.get("attackId")
     return None
 
 
@@ -468,40 +465,49 @@ def _boss_setup_reward(prev_obs, cur_obs, me_index, opp_index):
 
 
 _turns_taken = {0: 0, 1: 0}
+_attacked_this_turn = {0: False, 1: False}
 
 
 def reset_turn_tracking():
     """Call at the start of every new game (both self-play and
     heuristic-opponent mode) -- see _no_attack_turn_penalty."""
-    global _turns_taken
+    global _turns_taken, _attacked_this_turn
     _turns_taken = {0: 0, 1: 0}
+    _attacked_this_turn = {0: False, 1: False}
 
 
-def _no_attack_turn_penalty(prev_obs, cur_obs, me_index):
-    """Penalize ending our own turn (turn control passing to the opponent)
-    without attacking, from our 2nd turn onward. Turn-passing is read off
-    current.yourIndex flipping between prev_obs and cur_obs -- the same field
-    this module already keys "me" off of, so more solidly grounded than a
-    guessed log-event name, but it still assumes every yourIndex flip is a
-    full turn change (not, say, a mid-turn prompt directed at the opponent)
-    and that an Attack log entry always appears in the flipping step's delta
-    when we do attack (matches the "attack ends the turn" rule noted in
-    starmie_agent.py's score-priority comment).
+def _no_attack_turn_penalty(cur_obs, me_index):
+    """Penalize ending our own turn without attacking, from our 2nd turn on.
 
-    Needs per-player state across steps -- this can't be answered from one
-    (prev_obs, cur_obs) pair alone. Only correct for one game running in this
-    process at a time; reset_turn_tracking() must be called on every new
-    game, and this will misbehave if multiple games run concurrently through
-    a shared process without keying the state by game/env id.
+    Driven by the engine's own TURN_END event for our player index. The
+    previous version instead watched current.yourIndex flip from me_index to
+    the opponent -- which NEVER happens from the learner's vantage point:
+    CabtEnv replays the opponent's whole turn before handing control back
+    (cabt_env.py _play_opponent_until_learner_turn), so every observation the
+    learner ever sees already has yourIndex == me_index. That made this term a
+    guaranteed 0.0 regardless of the log schema, so fixing the log types alone
+    would not have revived it.
+
+    "Did we attack this turn" is tracked across steps rather than read from
+    the turn-ending step's delta alone: an attack that requires a follow-up
+    selection (choosing damage-counter targets, say) puts the ATTACK entry in
+    an EARLIER delta than the TURN_END, and checking only the final delta
+    would penalize a turn we did attack on.
+
+    Needs per-player state across steps, so it is only correct for one game at
+    a time in this process; reset_turn_tracking() must be called on every new
+    game, and this will misbehave if concurrent games share a process without
+    keying the state by game/env id.
     """
-    cur_mover = (cur_obs.get("current") or {}).get("yourIndex")
-    if cur_mover == me_index:
+    if _log_entries(cur_obs, LOG_ATTACK, me_index):
+        _attacked_this_turn[me_index] = True
+
+    if not _log_entries(cur_obs, LOG_TURN_END, me_index):
         return 0.0
+
     _turns_taken[me_index] = _turns_taken.get(me_index, 0) + 1
-    attacked = any(
-        isinstance(e, dict) and e.get("type") == "Attack" and e.get("playerIndex") == me_index
-        for e in (cur_obs.get("logs") or [])
-    )
+    attacked = _attacked_this_turn[me_index]
+    _attacked_this_turn[me_index] = False
     if _turns_taken[me_index] >= 2 and not attacked:
         return NO_ATTACK_PENALTY
     return 0.0
@@ -510,19 +516,35 @@ def _no_attack_turn_penalty(prev_obs, cur_obs, me_index):
 # ── Follow-up shaping-term helpers ──
 
 def _hand_size(obs_dict, player_index):
+    """Cards in player_index's hand, from the public `handCount`.
+
+    NOT len(hand): PlayerState.hand is None for the opponent (their cards are
+    hidden), while handCount is public for both. Every caller here asks about
+    the OPPONENT's hand -- Resentful Refrain scales with it -- so the old
+    len(hand or []) returned 0 every single time.
+    """
     players = _players(obs_dict)
     if player_index >= len(players):
         return 0
-    return len((players[player_index] or {}).get("hand") or [])
+    count = (players[player_index] or {}).get("handCount")
+    return count if isinstance(count, int) else 0
 
 
 def _deck_remaining(obs_dict, player_index):
-    """Same list-length-as-count convention as _prizes_remaining (deck
-    contents are hidden too, but the count is public in real TCG rules)."""
+    """Cards left in player_index's deck, from the public `deckCount`.
+
+    There is no `deck` list in PlayerState (deck contents are hidden; only the
+    count is exposed, as in real TCG rules), so the old len(deck or []) was
+    always 0 -- which made deck_save's "deck is nearly out" guard vacuously
+    true and paid the agent for ANY Dudunsparce leaving play, including being
+    knocked out. That is the likely source of its implausible ~1.1
+    triggers/episode in the v13 run.
+    """
     players = _players(obs_dict)
     if player_index >= len(players):
         return 0
-    return len((players[player_index] or {}).get("deck") or [])
+    count = (players[player_index] or {}).get("deckCount")
+    return count if isinstance(count, int) else 0
 
 
 def _mega_starmie_available(obs_dict, player_index):
@@ -717,7 +739,7 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
             and _prizes_remaining(prev_obs, me_index) > 2):
         evolve_matchup_penalty += ARCHALUDON_EVOLVE_PENALTY
 
-    no_attack_penalty = _no_attack_turn_penalty(prev_obs, cur_obs, me_index)
+    no_attack_penalty = _no_attack_turn_penalty(cur_obs, me_index)
 
     # Signed contributions -- penalties negated here so the total is a plain
     # sum and each logged series reads with its true sign.
