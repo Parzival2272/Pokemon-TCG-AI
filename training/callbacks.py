@@ -4,7 +4,7 @@ from collections import defaultdict
 
 from stable_baselines3.common.callbacks import BaseCallback
 
-from training.rewards import REWARD_TERMS
+from training.crustle_rewards import REWARD_TERMS
 
 
 # Opponent tags that are the learner playing a copy of itself: a frozen

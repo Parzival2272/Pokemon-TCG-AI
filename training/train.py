@@ -273,7 +273,7 @@ if __name__ == "__main__":
     )
     elapsed = time.perf_counter() - start
 
-    model_name = "ppo_starmie_v16"
+    model_name = "ppo_crustle_v1"
     model.save(model_name)
 
     # ---- End-of-training report -------------------------------------------
