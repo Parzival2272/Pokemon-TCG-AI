@@ -37,11 +37,11 @@ Two named threats the shaping treats specially:
 WHAT I CHANGED VS THE STARMIE FILE (read before porting anything back)
 ---------------------------------------------------------------------
 1. `_energies()` reads "energies" first, falling back to "energyCards".
-   Both keys exist on a live Pokemon: `energies` is list[EnergyType] (what an
-   attack cost is paid with) and `energyCards` is list[Card]. Every caller
-   here is a cost threshold, so `energies` is the right one; the starmie
-   file's hardcoded "energyCards" happens to give the same count for basic
-   Energy but diverges on anything providing 0 or 2+ units.
+   crustle_agent.py's typed API exposes `Pokemon.energies`, so the raw JSON
+   key is almost certainly "energies" -- the starmie file's hardcoded
+   "energyCards" is a likely-dead lookup and its ignition/mega-available
+   terms may have been silently zero for the same reason its LogType string
+   comparisons were. Verify against a real obs dump.
 2. The bench-size penalty is TRANSITION-based, not state-based. The starmie
    file charges BENCH_OVER_4_PENALTY on *every decision step* while the board
    is too wide, which for a several-hundred-step episode is an enormous
@@ -52,42 +52,16 @@ WHAT I CHANGED VS THE STARMIE FILE (read before porting anything back)
    hot. Measure first (the starmie file's post-mortem comments are the
    cautionary tale), then tune.
 
-VERIFICATION STATUS: every card ID below was checked against CARD_DB by name,
-and the observation schema was confirmed by instrumenting real games (see the
-post-mortem below). `cardIdTarget` on Attach entries -- previously only
-assumed -- does carry the receiving Pokemon's card ID, so the energy_target
-and hero_cape terms are sound.
-
-Two properties of `logs` that the terms here depend on, both confirmed:
-  * It is a PER-VIEWER window: the engine reports each event exactly once to
-    each player, covering everything since *that* player's previous decision.
-    So a learner step that spans the opponent's whole turn sees that turn's
-    events once, and nothing is double counted -- provided the observation
-    being read belongs to the same viewer as `me_index`. That holds for every
-    CabtEnv path that has an opponent agent (the learner is a fixed side); it
-    does NOT hold for CabtEnv's pure-self-play fallback, where cur_obs may be
-    rendered for the other player.
-  * TURN_END carries the playerIndex of the player whose turn ended, which is
-    what _turn_end_penalties keys off.
-
-POST-MORTEM: MaskablePPO_18 (why 20 of the 31 series were flat 0.0)
--------------------------------------------------------------------
-Run 18 logged exactly the terms this file shares with training/rewards.py and
-zeroed every crustle-specific one. Cause: only callbacks.py had been switched
-to this module -- CabtEnv still imported training.rewards and still played the
-starmie deck.csv, so RewardTermCallback was writing this file's key list
-against another file's numbers, and the keys with no counterpart came out 0.
-Four genuine bugs in here were hidden behind that and are now fixed:
-  * `deck` is not a PlayerState field (it is `deckCount`)  -> deck_out
-  * `hand` is None for the opponent (use `handCount`)      -> xerosic
-  * CardType has no ENERGY member, only BASIC_/SPECIAL_    -> hammer, retreat
-  * CardData.energyType is a raw int, not an enum          -> kangaskhan_fighting
-plus turn hand-off being read off a yourIndex flip that the env never shows
-the learner (-> no_attack, run_errand) and nobody calling reset_game_state()
-between episodes (-> lead, setup_tempo latched after one game per worker).
-
-Terms that log a flat 0.0 for a whole run are broken, not inactive -- that is
-what REWARD_TERMS exists to make visible.
+VERIFICATION STATUS: card IDs below are read off Card_ID_List_EN.pdf and card
+text off the printed cards, so those are solid. Observation-schema
+assumptions are inherited from the starmie file, which documents which ones
+were confirmed against real obs["logs"] dumps: Evolve/Attach/HpChange/Draw/
+Attack entry shapes and the LogType-is-an-IntEnum finding are confirmed;
+`cardIdTarget` on Attach entries (used here to tell *which Pokemon* received
+an energy or tool) is documented there but not independently confirmed by me,
+and every helper that needs it fails safe to 0 rather than raising. Terms
+that log a flat 0.0 for a whole run are broken, not inactive -- that is what
+REWARD_TERMS exists to make visible.
 """
 
 from collections import Counter
@@ -111,7 +85,6 @@ MULTI_PRIZE_MULTIPLIER = 1.25
 DAMAGE_REWARD_PER_100 = 0.01
 DRAW_REWARD_PER_CARD = 0.001
 SUPPORTER_PLAY_REWARD = 0.005
-NO_ATTACK_PENALTY = 0.05
 
 # ── Energy attachment ─────────────────────────────────────────────────────
 # Base for any energy attached (never wasting the once-per-turn attachment),
@@ -216,7 +189,7 @@ KANGASKHAN_ATTACK_OVER_CRUSTLE_PENALTY = 0.020
 # Kangaskhan's whole job in the Active Spot is drawing 2 a turn for free. The
 # generic `draw` term pays 0.002 for that, which badly undervalues the single
 # most repeatable edge in the deck, so a missed activation is charged
-# directly. See _turn_end_penalties for why the detection is deliberately
+# directly. See _run_errand_penalty for why the detection is deliberately
 # biased toward false negatives.
 RUN_ERRAND_MISS_PENALTY = 0.010
 RUN_ERRAND_MIN_DRAWS = 2
@@ -326,18 +299,8 @@ try:
     LOG_EVOLVE = int(_LogType.EVOLVE)
     LOG_ATTACK = int(_LogType.ATTACK)
     LOG_HP_CHANGE = int(_LogType.HP_CHANGE)
-    LOG_TURN_END = int(_LogType.TURN_END)
 except Exception:
     LOG_DRAW, LOG_ATTACH, LOG_EVOLVE, LOG_ATTACK, LOG_HP_CHANGE = 4, 11, 12, 15, 16
-    LOG_TURN_END = 3
-
-# EnergyType.FIGHTING. CardData.energyType comes back as a raw int, so this is
-# compared numerically -- see _is_fighting_pokemon.
-try:
-    from ptcg.api import EnergyType as _EnergyType
-    FIGHTING_ENERGY_TYPE = int(_EnergyType.FIGHTING)
-except Exception:
-    FIGHTING_ENERGY_TYPE = 6
 
 
 # ── Shared accessors ──────────────────────────────────────────────────────
@@ -352,13 +315,11 @@ def _player(obs_dict, player_index):
 
 
 def _energies(mon):
-    """Energy *provided* by the cards attached to a Pokemon dict.
+    """Energy cards attached to a Pokemon dict.
 
-    CONFIRMED against a live obs: a Pokemon carries BOTH keys. `energies` is
-    list[EnergyType] -- the energy the attachments actually provide, which is
-    what an attack cost is paid with -- and `energyCards` is list[Card], the
-    physical cards. Every caller here is asking "can this thing pay {G}{C}{C}
-    yet", so `energies` is the one to prefer. Returns [] rather than raising.
+    crustle_agent.py's typed API exposes `Pokemon.energies`, so "energies" is
+    the likely raw key; "energyCards" (what the starmie file hardcodes) and
+    "energy" are tried as fallbacks. Returns [] rather than raising.
     """
     if not isinstance(mon, dict):
         return []
@@ -403,19 +364,7 @@ def _hand_ids(obs_dict, player_index):
 
 
 def _hand_size(obs_dict, player_index):
-    """Cards in hand. MUST read handCount, not len(hand).
-
-    PlayerState.hand is `list[Card] | None` and is None for the OPPONENT -- we
-    only ever see our own hand contents. len(hand or []) therefore returns 0
-    for every opponent query, which silently zeroed reward/xerosic (its whole
-    value is max(0, opp_hand - 3)) and killed the Xerosic/Eri branch of
-    _wanted_supporter_ids. handCount is present for both players.
-    """
-    p = _player(obs_dict, player_index)
-    count = p.get("handCount")
-    if isinstance(count, int):
-        return count
-    return len(p.get("hand") or [])
+    return len(_player(obs_dict, player_index).get("hand") or [])
 
 
 def _prizes_remaining(obs_dict, player_index):
@@ -423,16 +372,7 @@ def _prizes_remaining(obs_dict, player_index):
 
 
 def _deck_remaining(obs_dict, player_index):
-    """Cards left in deck. The field is deckCount -- PlayerState has no "deck"
-    key at all (the only `deck` in the schema is SelectData.deck, the cards
-    offered when searching). The old len(get("deck")) read 0 every step, so
-    both deck-out thresholds were compared against a constant 0 and
-    reward/deck_out could never fire."""
-    p = _player(obs_dict, player_index)
-    count = p.get("deckCount")
-    if isinstance(count, int):
-        return count
-    return len(p.get("deck") or [])
+    return len(_player(obs_dict, player_index).get("deck") or [])
 
 
 def _newly_discarded_ids(prev_obs, cur_obs, player_index):
@@ -500,18 +440,9 @@ def _classify(card_id, db_types, fallback_ids):
 
 
 def _is_energy_card(card_id):
-    # CardType has no ENERGY member -- it splits into BASIC_ENERGY (5) and
-    # SPECIAL_ENERGY (6). The old getattr(CardType, "ENERGY", object()) always
-    # resolved to a throwaway sentinel, so every BASIC energy card in the game
-    # classified as "not energy": Crushing Hammer's did-they-actually-lose-an-
-    # Energy check and the retreat-cost count both under-fired against decks
-    # running basic Energy (i.e. nearly every opponent in the pool).
     return _classify(
         card_id,
-        (
-            getattr(CardType, "BASIC_ENERGY", object()),
-            getattr(CardType, "SPECIAL_ENERGY", object()),
-        ),
+        (getattr(CardType, "ENERGY", object()), getattr(CardType, "SPECIAL_ENERGY", object())),
         DECK_ENERGY_IDS,
     )
 
@@ -538,34 +469,28 @@ def _prize_value_by_id(card_id):
 def _is_fighting_pokemon(card_id):
     """True if the card is a {F} Pokemon.
 
-    CONFIRMED: the field is CardData.energyType, and to_dataclass leaves it as
-    a RAW INT (EnergyType.FIGHTING == 6), not an enum member. The previous
-    version stringified the value and looked for "FIGHT" in it, which for the
-    int 6 gives "6" -- so the largest single penalty in this file
-    (KANGASKHAN_INTO_FIGHTING_PENALTY) never once fired. Compare numerically;
-    the name/str branches are kept only in case the DLL later hands back real
-    enum members.
+    NOT verified: which attribute CARD_DB exposes a Pokemon's Energy type on
+    is a guess, so several plausible names are tried and each is matched
+    loosely (enum, enum name, or bare string). Returns False when nothing
+    resolves, which zeroes the Kangaskhan-into-Fighting penalty rather than
+    firing it wrongly. Dump {getattr(CARD_DB[MEGA_KANGASKHAN_EX], a, None)
+    for a in dir(...)} once and pin this to the real field.
     """
     if not CARD_DB or card_id is None:
         return False
     data = CARD_DB.get(card_id)
     if data is None:
         return False
-    # Only Pokemon have a meaningful energyType here -- a Fighting *Energy*
-    # card carries energyType 6 too, and this must not call it a Pokemon.
-    card_type = getattr(data, "cardType", None)
-    if card_type is not None and CardType is not None and card_type != CardType.POKEMON:
-        return False
-    val = getattr(data, "energyType", None)
-    if val is None:
-        return False
-    candidates = val if isinstance(val, (list, tuple, set)) else [val]
-    for c in candidates:
-        if isinstance(c, int) and c == FIGHTING_ENERGY_TYPE:
-            return True
-        name = str(getattr(c, "name", None) or c).upper()
-        if name in ("F", "FIGHTING"):
-            return True
+    for attr in ("type", "types", "pokemonType", "pokemonTypes", "energyType"):
+        val = getattr(data, attr, None)
+        if val is None:
+            continue
+        candidates = val if isinstance(val, (list, tuple, set)) else [val]
+        for c in candidates:
+            name = getattr(c, "name", None) or str(c)
+            name = name.upper()
+            if name in ("F", "FIGHTING") or "FIGHT" in name:
+                return True
     return False
 
 
@@ -732,27 +657,18 @@ _lead_scored = {0: False, 1: False}
 _setup_scored = {0: False, 1: False}
 _turn_draws = {0: 0, 1: 0}
 _turn_kangaskhan_active = {0: False, 1: False}
-_turn_attacked = {0: False, 1: False}
 
 
 def reset_turn_tracking():
     """Call at the start of every game, both self-play and heuristic-opponent
     mode. Only correct for one game per process at a time -- key this by env
-    id if games ever run concurrently through a shared process.
-
-    CabtEnv.reset() calls this. It is not optional: _lead_scored and
-    _setup_scored are one-shot latches, so a worker that never resets them
-    pays `lead` and `setup_tempo` on its first episode and 0.0 for every
-    episode after that.
-    """
-    global _turns_taken, _lead_scored, _setup_scored, _turn_draws
-    global _turn_kangaskhan_active, _turn_attacked
+    id if games ever run concurrently through a shared process."""
+    global _turns_taken, _lead_scored, _setup_scored, _turn_draws, _turn_kangaskhan_active
     _turns_taken = {0: 0, 1: 0}
     _lead_scored = {0: False, 1: False}
     _setup_scored = {0: False, 1: False}
     _turn_draws = {0: 0, 1: 0}
     _turn_kangaskhan_active = {0: False, 1: False}
-    _turn_attacked = {0: False, 1: False}
 
 
 # Alias: this now resets lead, setup and per-turn accumulators too, not just
@@ -760,29 +676,17 @@ def reset_turn_tracking():
 reset_game_state = reset_turn_tracking
 
 
-def _turn_end_penalties(prev_obs, cur_obs, me_index):
-    """(no_attack, run_errand_missed) -- both only fire on turn hand-off.
+def _run_errand_penalty(prev_obs, cur_obs, me_index):
+    """Charge for a turn that held Kangaskhan Active without drawing off Run
+    Errand. Only settles on turn hand-off.
 
-    Accumulates three things across the steps of our turn and settles them on
-    the step whose log window contains our TURN_END: whether we attacked at
-    all, how many cards we drew, and whether Kangaskhan held the Active Spot.
+    Accumulates two things across the steps of our turn and settles them when
+    current.yourIndex flips away from us: whether Kangaskhan ever held the
+    Active Spot, and how many cards we drew in total. Turn hand-off is read
+    off the yourIndex flip, which assumes every flip is a real turn change
+    rather than a mid-turn prompt aimed at the opponent.
 
-    Hand-off is detected from the TURN_END log entry, NOT from a
-    current.yourIndex flip. The yourIndex test never fired in the real
-    training env: CabtEnv auto-plays the opponent through
-    _play_opponent_until_learner_turn, so every observation the learner is
-    scored on already has yourIndex back on the learner and the whole branch
-    was dead -- reward/no_attack and reward/run_errand logged a flat 0.0 for
-    entire runs. `logs` is a per-viewer window (the engine reports each event
-    exactly once to each player), so our TURN_END lands in exactly one of our
-    steps even when that step spans the opponent's entire turn.
-
-    `attacked` likewise has to accumulate: cur_obs's log window only covers
-    the events since our previous decision, so checking it alone charges
-    NO_ATTACK_PENALTY on every turn where the attack wasn't the very last
-    thing we did.
-
-    The Run Errand check is deliberately conservative. Draws from Lillie,
+    The check is deliberately conservative. Draws from Lillie,
     Petrel-into-a-draw-card or Team Rocket's Factory all land in the same
     counter, so a turn that skipped the Ability but drew off a Supporter looks
     identical to one that used it -- the threshold of 2 means we under-charge
@@ -790,32 +694,24 @@ def _turn_end_penalties(prev_obs, cur_obs, me_index):
     RUN_ERRAND_MIN_DRAWS to 3 only after confirming the turn-start draw is
     logged with our playerIndex.
 
-    Must be called exactly once per step: it mutates the accumulators.
+    Must be called exactly once per step: it mutates the accumulators, and it
+    is what advances _turns_taken (which SETUP_TEMPO_DECAY_PER_TURN reads).
     """
     _turn_draws[me_index] = _turn_draws.get(me_index, 0) + _draw_count(cur_obs, me_index)
-    if _entries(cur_obs, LOG_ATTACK, me_index):
-        _turn_attacked[me_index] = True
     active = _active_pokemon(prev_obs, me_index)
     if active and active.get("id") == MEGA_KANGASKHAN_EX:
         _turn_kangaskhan_active[me_index] = True
 
-    if not _entries(cur_obs, LOG_TURN_END, me_index):
-        return 0.0, 0.0
+    if (cur_obs.get("current") or {}).get("yourIndex") == me_index:
+        return 0.0
 
     _turns_taken[me_index] = _turns_taken.get(me_index, 0) + 1
-    no_attack = (NO_ATTACK_PENALTY
-                 if (_turns_taken[me_index] >= 2 and not _turn_attacked[me_index])
-                 else 0.0)
-
-    run_errand = 0.0
-    if (_turn_kangaskhan_active[me_index]
-            and _turn_draws[me_index] < RUN_ERRAND_MIN_DRAWS):
-        run_errand = RUN_ERRAND_MISS_PENALTY
+    missed = (_turn_kangaskhan_active[me_index]
+              and _turn_draws[me_index] < RUN_ERRAND_MIN_DRAWS)
 
     _turn_draws[me_index] = 0
     _turn_kangaskhan_active[me_index] = False
-    _turn_attacked[me_index] = False
-    return no_attack, run_errand
+    return RUN_ERRAND_MISS_PENALTY if missed else 0.0
 
 
 def _lead_reward(prev_obs, cur_obs, me_index):
@@ -1180,7 +1076,6 @@ REWARD_TERMS = (
     "deck_out",
     "run_errand",
     "lead",
-    "no_attack",
 )
 
 
@@ -1210,8 +1105,9 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
     crustle_evolved = max(0, _count_in_play(cur_obs, me_index, CRUSTLE)
                           - _count_in_play(prev_obs, me_index, CRUSTLE))
 
-    # Settles the per-turn accumulators; must be called exactly once per step.
-    no_attack, run_errand = _turn_end_penalties(prev_obs, cur_obs, me_index)
+    # Settles the per-turn accumulators and advances the turn counter; must
+    # be called exactly once per step.
+    run_errand = _run_errand_penalty(prev_obs, cur_obs, me_index)
 
     terms = {
         "prize_mine": my_prize_reward,
@@ -1246,7 +1142,6 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
         "deck_out": -_deck_out_penalty(prev_obs, cur_obs, me_index),
         "run_errand": -run_errand,
         "lead": _lead_reward(prev_obs, cur_obs, me_index),
-        "no_attack": -no_attack,
     }
 
     if SHAPING_SCALE != 1.0:
