@@ -1,12 +1,12 @@
-"""Behavior-cloning (BC) warm start from the starmie heuristic.
+"""Behavior-cloning (BC) warm start from the crustle heuristic.
 
 Instead of PPO starting from a virtually random policy, pretrain the policy
-net to imitate the starmie heuristic (which pilots the same DECK_PATH deck
+net to imitate the crustle heuristic (which pilots the same DECK_PATH deck
 the learner plays), then start PPO from those weights.
 
 Two stages, both in this file:
 
-1. Collection: the starmie expert drives CabtEnv's learner seat against the
+1. Collection: the crustle expert drives CabtEnv's learner seat against the
    usual heuristic OPPONENT_POOL. Each engine decision (a list of option
    indices) is decoded into the env's autoregressive action space -- one
    sample per pick, plus a STOP sample when the expert stops short of
@@ -21,7 +21,7 @@ Two stages, both in this file:
 
 Usage:
     python -m training.bc                  # collect + clone with defaults
-    BC_INIT=ppo_starmie_bc.zip python -m training.train
+    BC_INIT=ppo_crustle_bc.zip python -m training.train
 
 The saved zip is a normal MaskablePPO save; train.py's BC_INIT env var loads
 just its policy weights into the fresh model. Since SnapshotCallback saves
@@ -37,7 +37,7 @@ import numpy as np
 import torch as th
 import torch.nn.functional as F
 
-from heuristics.starmie_agent import agent as starmie_agent
+from heuristics.crustle_agent import agent as crustle_agent
 from training.cabt_env import POLICY_NET_ARCH, CabtEnv, _sanitize_selection
 
 # Matches train.py's PPO gamma so the value head is fit to the same return
@@ -51,7 +51,7 @@ GAMMA = 0.995
 
 
 def collect_dataset(n_episodes, seed=0):
-    """Roll `n_episodes` games with the starmie expert in the learner seat
+    """Roll `n_episodes` games with the crustle expert in the learner seat
     (vs the train.py heuristic pool) and return BC arrays.
 
     Returns dict with:
@@ -78,7 +78,7 @@ def collect_dataset(n_episodes, seed=0):
             # A fresh decision: env always finalizes before control returns
             # here, so _picked is empty and _sync_select_state has run.
             try:
-                raw = starmie_agent(env._obs)
+                raw = crustle_agent(env._obs)
             except Exception:
                 raw = []
             selected = _sanitize_selection(
@@ -277,7 +277,7 @@ def behavior_clone(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Behavior-clone the starmie heuristic into a MaskablePPO "
+        description="Behavior-clone the crustle heuristic into a MaskablePPO "
         "policy (see module docstring)."
     )
     # Collection runs ~30 games/s single-process. More data is the main lever
@@ -298,7 +298,7 @@ def main():
         default="bc_dataset.npz",
         help="dataset cache; loaded if it exists (delete to recollect)",
     )
-    parser.add_argument("--out", default="ppo_starmie_bc", help="model save path")
+    parser.add_argument("--out", default="ppo_crustle_bc", help="model save path")
     parser.add_argument("--device", default=os.environ.get("DEVICE", "cpu"))
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()

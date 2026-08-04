@@ -8,11 +8,16 @@ from training.obs_vectorizer import (
     obs_to_vector,
     set_vectorizer_deck,
 )
-from training.rewards import reward_terms
+from training.crustle_rewards import reset_game_state, reward_terms
 import numpy as np
 import gymnasium as gym
 
-DECK_PATH = "deck.csv"
+# The learner's deck. Must match the reward module imported above: the shaping
+# terms are keyed to specific card IDs, so pointing this at another deck makes
+# every deck-specific term dead weight (that is exactly what MaskablePPO_18
+# logged -- crustle shaping keys against the starmie deck.csv, so ~20 of the
+# 31 reward/<term> series were flat 0.0 for the whole run).
+DECK_PATH = "crustle_deck.csv"
 
 # Shared policy/value network architecture. bc.py builds a MaskablePPO with
 # this net_arch, and train.py warm-starts (load_state_dict, which is strict)
@@ -169,6 +174,14 @@ class CabtEnv(gym.Env):
         from ptcg.sim import Battle
 
         super().reset(seed=seed)
+        # The reward module keeps per-game state (opening-lead and setup-tempo
+        # one-shots, per-turn draw/attack accumulators) in module globals. Without
+        # this call those latch on the worker's FIRST episode and stay latched for
+        # the rest of the run, so `lead` and `setup_tempo` pay out once per worker
+        # process instead of once per game -- i.e. ~0.0 per episode in the logs.
+        # One battle per process (Battle.battle_ptr is global), so module-level
+        # state is safe here; key it by env id if that ever changes.
+        reset_game_state()
         # Free the previous episode's native battle before starting a new one,
         # or it leaks inside cg.dll. Battle.battle_ptr is the engine's own
         # record of the live battle (one per process, see train.py), so it --

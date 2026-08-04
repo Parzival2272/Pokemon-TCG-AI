@@ -250,7 +250,7 @@ if __name__ == "__main__":
 
     # Warm start: BC_INIT=<path.zip> copies the policy weights (actor AND
     # value head) out of a behavior-cloned model (training/bc.py) so PPO
-    # starts from "imitates the starmie heuristic" instead of random. Only
+    # starts from "imitates the crustle heuristic" instead of random. Only
     # the network weights are taken -- optimizer state and PPO hyperparams
     # stay fresh from the model built above. The initial league snapshot
     # (SnapshotCallback at training start) then captures the BC policy too.
@@ -273,7 +273,7 @@ if __name__ == "__main__":
     )
     elapsed = time.perf_counter() - start
 
-    model_name = "ppo_starmie_v16"
+    model_name = "ppo_crustle_v17"
     model.save(model_name)
 
     # ---- End-of-training report -------------------------------------------
