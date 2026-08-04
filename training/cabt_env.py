@@ -172,14 +172,6 @@ class CabtEnv(gym.Env):
         from ptcg.sim import Battle
 
         super().reset(seed=seed)
-        # The reward module keeps per-game state (opening-lead and setup-tempo
-        # one-shots, per-turn draw/attack accumulators) in module globals. Without
-        # this call those latch on the worker's FIRST episode and stay latched for
-        # the rest of the run, so `lead` and `setup_tempo` pay out once per worker
-        # process instead of once per game -- i.e. ~0.0 per episode in the logs.
-        # One battle per process (Battle.battle_ptr is global), so module-level
-        # state is safe here; key it by env id if that ever changes.
-        reset_game_state()
         # Free the previous episode's native battle before starting a new one,
         # or it leaks inside cg.dll. Battle.battle_ptr is the engine's own
         # record of the live battle (one per process, see train.py), so it --
@@ -191,9 +183,15 @@ class CabtEnv(gym.Env):
         # Prize-belief features are always from the learner's perspective, so
         # the vectorizer deck is the learner's deck regardless of opponent.
         set_vectorizer_deck(learner_deck)
-        # rewards.py's no-attack term counts each side's turns across steps;
-        # without this the counter carries into the next episode and turn 1 of
-        # every game after the first loses its intended grace period.
+        # The reward module keeps all per-game state in module globals: the
+        # turn counter the no-attack term reads, the per-turn draw/attack
+        # accumulators, and the opening-lead/setup-tempo one-shot latches.
+        # Without this the counter carries into the next episode (turn 1 of
+        # every game after the first loses its grace period) and the latches
+        # stay set for the life of the worker, so `lead` and `setup_tempo` pay
+        # out once per process instead of once per game -- ~0.0 per episode in
+        # the logs. One battle per process (Battle.battle_ptr is global), so
+        # module-level state is safe here; key it by env id if that changes.
         reset_turn_tracking()
 
         # A callable pool is re-evaluated every episode so it can grow/shrink
