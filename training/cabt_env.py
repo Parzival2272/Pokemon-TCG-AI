@@ -8,16 +8,14 @@ from training.obs_vectorizer import (
     obs_to_vector,
     set_vectorizer_deck,
 )
-from training.crustle_rewards import reset_game_state, reward_terms
+from training.crustle_rewards import reset_turn_tracking, reward_terms
 import numpy as np
 import gymnasium as gym
 
-# The learner's deck. Must match the reward module imported above: the shaping
-# terms are keyed to specific card IDs, so pointing this at another deck makes
-# every deck-specific term dead weight (that is exactly what MaskablePPO_18
-# logged -- crustle shaping keys against the starmie deck.csv, so ~20 of the
-# 31 reward/<term> series were flat 0.0 for the whole run).
-DECK_PATH = "crustle_deck.csv"
+# The learner's deck. Paired with the reward module imported above: the shaping
+# in crustle_rewards.py keys on this list's card IDs (Dwebble/Crustle, Mega
+# Kangaskhan ex, Hero's Cape), so the two must be swapped together.
+DECK_PATH = "heuristics/crustle_agent/crustle_deck.csv"
 
 # Shared policy/value network architecture. bc.py builds a MaskablePPO with
 # this net_arch, and train.py warm-starts (load_state_dict, which is strict)
@@ -193,6 +191,10 @@ class CabtEnv(gym.Env):
         # Prize-belief features are always from the learner's perspective, so
         # the vectorizer deck is the learner's deck regardless of opponent.
         set_vectorizer_deck(learner_deck)
+        # rewards.py's no-attack term counts each side's turns across steps;
+        # without this the counter carries into the next episode and turn 1 of
+        # every game after the first loses its intended grace period.
+        reset_turn_tracking()
 
         # A callable pool is re-evaluated every episode so it can grow/shrink
         # mid-run (league snapshots); a plain list is used as-is.
