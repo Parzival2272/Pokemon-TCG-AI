@@ -15,7 +15,7 @@ import gymnasium as gym
 # The learner's deck. Paired with the reward module imported above: the shaping
 # in crustle_rewards.py keys on this list's card IDs (Dwebble/Crustle, Mega
 # Kangaskhan ex, Hero's Cape), so the two must be swapped together.
-DECK_PATH = "heuristics/crustle_agent/crustle_deck.csv"
+DECK_PATH = "crustle_deck.csv"
 
 # Shared policy/value network architecture. bc.py builds a MaskablePPO with
 # this net_arch, and train.py warm-starts (load_state_dict, which is strict)
