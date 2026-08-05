@@ -21,6 +21,8 @@ from heuristics.archaludon_agent import agent as archaludon_agent
 from heuristics.alakazam_agent import agent as alakazam_agent
 from heuristics.alakazam_v2_agent import agent as alakazam_v2_agent
 from heuristics.starmie_agent import agent as starmie_agent
+from heuristics.grimmsnarl_agent import agent as grimmsnarl_agent
+from heuristics.lucario import agent as lucario_agent
 import heuristics.alakazam_v2_agent.alakazam_v2_agent as _alakazam_v2_module
 
 # alakazam_v2 ships a 2-ply minimax (ptcg.api search_begin/step/end) on top of
@@ -28,7 +30,7 @@ import heuristics.alakazam_v2_agent.alakazam_v2_agent as _alakazam_v2_module
 # search_begin_input, so it really runs here -- measured in this env at 10.5s
 # of search out of 10.8s total for 2 episodes, versus 0.4s for the same two
 # episodes with it off (~27x). Opponents are drawn uniformly per episode, so
-# leaving it on would let one of nine opponents eat the large majority of all
+# leaving it on would let one of eleven opponents eat the large majority of all
 # rollout wall-clock. The heuristic core -- tuned weights, the Hammer-aware
 # lethal search, the Teleportation guard -- is unaffected by this flag; only
 # the minimax is. Set ALAKAZAM_V2_SEARCH=1 to train against the full agent.
@@ -78,6 +80,15 @@ OPPONENT_POOL = [
         _load_deck("heuristics/alakazam_v2_agent/deck.csv"),
     ),
     ("starmie", starmie_agent, _load_deck("heuristics/starmie_agent/deck.csv")),
+    (
+        "grimmsnarl",
+        grimmsnarl_agent,
+        _load_deck("heuristics/grimmsnarl_agent/deck.csv"),
+    ),
+    # lucario/ is the one heuristic laid out as a standalone Kaggle
+    # submission rather than an agent package -- see its __init__.py for the
+    # `cg` -> ptcg aliasing that makes it importable here.
+    ("lucario", lucario_agent, _load_deck("heuristics/lucario/deck.csv")),
 ]
 
 # Which device MaskablePPO trains the policy/value networks on. Defaults to
