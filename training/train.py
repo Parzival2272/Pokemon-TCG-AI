@@ -19,7 +19,26 @@ from heuristics.dragapult_v2_agent import agent as dragapult_v2_agent
 from heuristics.iono_agent import agent as iono_agent
 from heuristics.archaludon_agent import agent as archaludon_agent
 from heuristics.alakazam_agent import agent as alakazam_agent
+from heuristics.alakazam_v2_agent import agent as alakazam_v2_agent
 from heuristics.starmie_agent import agent as starmie_agent
+import heuristics.alakazam_v2_agent.alakazam_v2_agent as _alakazam_v2_module
+
+# alakazam_v2 ships a 2-ply minimax (ptcg.api search_begin/step/end) on top of
+# its heuristic, budgeted at 0.8s per MAIN decision. CabtEnv DOES supply
+# search_begin_input, so it really runs here -- measured in this env at 10.5s
+# of search out of 10.8s total for 2 episodes, versus 0.4s for the same two
+# episodes with it off (~27x). Opponents are drawn uniformly per episode, so
+# leaving it on would let one of nine opponents eat the large majority of all
+# rollout wall-clock. The heuristic core -- tuned weights, the Hammer-aware
+# lethal search, the Teleportation guard -- is unaffected by this flag; only
+# the minimax is. Set ALAKAZAM_V2_SEARCH=1 to train against the full agent.
+# This assignment must stay at module level: SubprocVecEnv workers re-import
+# this module on spawn, so that is what propagates the flag into them.
+_alakazam_v2_module.USE_SEARCH = os.environ.get("ALAKAZAM_V2_SEARCH") == "1"
+
+# The search reads the engine through a separate native handle (ptcg.api's
+# agent_ptr from lib.AgentStart()), not Battle.battle_ptr, so enabling it
+# cannot corrupt the worker's live battle -- it is purely a speed tradeoff.
 
 
 def _load_deck(path):
@@ -35,7 +54,7 @@ def _load_deck(path):
 # a heuristic piloting a foreign deck wouldn't exercise the strategy it was
 # written for. The learner always plays the CabtEnv DECK_PATH deck.
 OPPONENT_POOL = [
-    ("crustle", crustle_agent, _load_deck("heuristics/crustle_agent/crustle_deck.csv")),
+    ("crustle", crustle_agent, _load_deck("heuristics/crustle_agent/deck.csv")),
     ("abomasnow", abomasnow_agent, _load_deck("heuristics/abomasnow_agent/deck.csv")),
     ("dragapult", dragapult_agent, _load_deck("heuristics/dragapult_agent/deck.csv")),
     (
@@ -53,6 +72,11 @@ OPPONENT_POOL = [
     # picks on "discard exactly 3", IndexError on some board states), so it
     # plays artificially weak and inflates win rates. Re-add once fixed.
     ("alakazam", alakazam_agent, _load_deck("heuristics/alakazam_agent/deck.csv")),
+    (
+        "alakazam_v2",
+        alakazam_v2_agent,
+        _load_deck("heuristics/alakazam_v2_agent/deck.csv"),
+    ),
     ("starmie", starmie_agent, _load_deck("heuristics/starmie_agent/deck.csv")),
 ]
 

@@ -1,6 +1,11 @@
-"""Inference wrapper that exposes the trained MaskablePPO starmie policy as an
+"""Inference wrapper that exposes the trained MaskablePPO policy as an
 `agent(obs_dict) -> list[int]` callable, matching the heuristic agents'
 interface so it can be dropped into main.py's AGENTS dict.
+
+The shipped default is the Mega Kangaskhan ex / Crustle policy
+(models/ppo_crustle_v17_weights.npz), trained on crustle_deck.csv -- which is
+what the root deck.csv must be a copy of, since the observation's prize-belief
+block is computed against the deck loaded below.
 
 Runs on plain NumPy weights (an .npz exported by tools/export_policy_weights.py)
 rather than loading the sb3_contrib MaskablePPO .zip directly: Kaggle's
@@ -19,9 +24,10 @@ once, so this wrapper produces it by looping the network internally -- feeding
 each pass the partial selection via obs_to_vector(obs_dict, picked=...) -- the
 same rollout CabtEnv performs across gym steps during training.
 
-Network shape (MlpPolicy default):
-    obs (VECTOR_SIZE,) -> Linear(.,64) -> Tanh -> Linear(64,64) -> Tanh
-                       -> Linear(64, MAX_OPTIONS + 1) logits
+Network shape (POLICY_NET_ARCH in training/cabt_env.py, currently [256, 256]);
+the layer widths are read off the loaded weights, so only the depth is fixed:
+    obs (VECTOR_SIZE,) -> Linear(.,H) -> Tanh -> Linear(H,H) -> Tanh
+                       -> Linear(H, MAX_OPTIONS + 1) logits
 The chosen action is argmax over the currently-legal logits (masking is
 monotone-safe, so comparing raw logits matches comparing softmax probabilities).
 """
@@ -38,11 +44,31 @@ from training.obs_vectorizer import (
 )
 
 _project_root = os.path.dirname(os.path.abspath(__file__))
-# Kaggle submission always runs the v13 weights (the default). Local tooling
-# (e.g. local_test.py running v3 vs itself) can point this at a different
-# export via the PPO_WEIGHTS env var without touching the submission default.
-_weights_path = os.environ.get(
-    "PPO_WEIGHTS", os.path.join(_project_root, "ppo_starmie_v13_weights.npz")
+
+
+def _resolve_weights(path: str) -> str:
+    """Locate a weights export. A bare filename is looked up in models/ (where
+    training and tools/export_policy_weights.py write) and then next to this
+    file, so both the repo layout and an older flat submission bundle work. A
+    path with a directory component is taken as-is."""
+    if os.path.isabs(path) or os.path.dirname(path):
+        return path
+    candidates = [
+        os.path.join(_project_root, "models", path),
+        os.path.join(_project_root, path),
+    ]
+    for candidate in candidates:
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0]  # missing: report the models/ path in the load error
+
+
+# Kaggle submission always runs the crustle v17 weights (the default). Local
+# tooling (e.g. local_test.py running an older export against itself) can point
+# this at a different file via the PPO_WEIGHTS env var without touching the
+# submission default.
+_weights_path = _resolve_weights(
+    os.environ.get("PPO_WEIGHTS", "ppo_crustle_v17_weights.npz")
 )
 _deck_path = os.path.join(_project_root, "deck.csv")
 

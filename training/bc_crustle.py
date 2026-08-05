@@ -94,11 +94,11 @@ def collect_dataset(n_episodes, seed=0):
 
     learner_deck = _load_deck()
     _assert_crustle_deck(learner_deck)
-    # crustle_agent caches a module-level `deck` read from the repo-root
-    # deck.csv at import time -- which is the starmie list. It only surfaces on
-    # the deck-submission call (select is None), which CabtEnv never routes
-    # through the agent, but leaving a foreign deck on the expert is a trap for
-    # whoever reuses it next.
+    # crustle_agent caches a module-level `deck` at import time, read from the
+    # deck.csv shipped in its own package. That is already the crustle list, so
+    # this is now belt-and-braces rather than a fix -- but DECK_PATH is what
+    # the learner actually plays, and pinning the expert to the same list keeps
+    # the two from drifting if either file is edited.
     crustle_set_deck(learner_deck)
 
     env = CabtEnv(opponent_agents=OPPONENT_POOL)

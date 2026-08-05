@@ -27,14 +27,15 @@ from heuristics.archaludon_agent import agent as archaludon_agent
 from heuristics.ragingbolt_agent import agent as ragingbolt_agent
 import heuristics.ragingbolt_agent.ragingbolt_agent as _ragingbolt_module
 from heuristics.alakazam_agent import agent as alakazam_agent
+from heuristics.alakazam_v2_agent import agent as alakazam_v2_agent
 from heuristics.starmie_agent import agent as starmie_agent
 
 _ragingbolt_module.DEBUG = False  # silence its per-step hand/option dump
 
-# (name, agent fn, deck.csv path). crustle_agent reads the project-root
-# deck.csv; every other package-style agent ships its own deck.csv.
+# (name, agent fn, deck.csv path). Every package-style agent ships its own
+# deck.csv.
 HEURISTICS = [
-    ("crustle", crustle_agent, "deck.csv"),
+    ("crustle", crustle_agent, "heuristics/crustle_agent/deck.csv"),
     ("abomasnow", abomasnow_agent, "heuristics/abomasnow_agent/deck.csv"),
     ("dragapult", dragapult_agent, "heuristics/dragapult_agent/deck.csv"),
     ("dragapult_v2", dragapult_v2_agent, "heuristics/dragapult_v2_agent/deck.csv"),
@@ -42,6 +43,7 @@ HEURISTICS = [
     ("archaludon", archaludon_agent, "heuristics/archaludon_agent/deck.csv"),
     ("ragingbolt", ragingbolt_agent, "heuristics/ragingbolt_agent/deck.csv"),
     ("alakazam", alakazam_agent, "heuristics/alakazam_agent/deck.csv"),
+    ("alakazam_v2", alakazam_v2_agent, "heuristics/alakazam_v2_agent/deck.csv"),
     ("starmie", starmie_agent, "heuristics/starmie_agent/deck.csv"),
 ]
 

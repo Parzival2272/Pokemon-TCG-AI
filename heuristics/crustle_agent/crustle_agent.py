@@ -1,13 +1,71 @@
-# TODO
-# Switch Ice Cream and Potion from not only working on actives
-# More In Depth Logic for Cards not already Done (Basically remove generic play score)
-# Make Boss Order's Logic Better (Lowkey just look at someone else's code for this)
-# Make Lillie's Logic Better
-# Mist Energy Logic
-# Xero Logic
-# Ultra Ball Logic
-# Logic for when to put energy on Kangaskhan(play around it)
+"""Mega Kangaskhan ex / Crustle heuristic.
 
+Pilots the 60 cards in this package's deck.csv (a copy of the repo-root
+crustle_deck.csv). Replaced the original hand-written version, which it beat
+79% over 100 mirror games (79W-21L, seating alternated) -- same decklist on
+both sides, so that number is piloting alone. `git log` this file for the
+version it replaced.
+
+Structure is borrowed from dashimaki360's public "Beating the Day-1 #1 Crustle
+Bot" notebook (kaggle.com/code/dashimaki360/beating-the-day-1-1-crustle-bot):
+score every option in `select.option`, sort descending, return the top indices
+while honouring minCount/maxCount. That notebook's one big idea is the whole
+skeleton here --
+
+    do ALL your setup first, attack last, and always return a *valid* choice
+    for any forced sub-selection
+
+-- because attacking ends the turn, so every point of score above the attack
+band is an action you get for free first.
+
+What this file adds on top of that skeleton is the deck plan encoded in
+training/crustle_rewards.py, expressed as scores instead of rewards:
+
+  * energy goes on the Crustle line, never on Kangaskhan while a line member
+    still wants it (Kangaskhan is a 3-prize liability);
+  * Dwebble -> Crustle is close to the highest-value action in the game;
+  * Hero's Cape belongs on the Crustle line (it survives the evolution, so
+    caping a Dwebble is fine);
+  * Jumbo Ice Cream is only played near its full 80;
+  * Boss's Orders prioritises the Froslass line, then KO range, then prizes;
+  * Switch (or Petrel fetching Switch) is the swap -- retreating a built
+    Crustle discards 3 Energy and throws the investment away;
+  * exactly 1 Kangaskhan + at most 2 Crustle-line members on board;
+  * Kangaskhan leads (300 HP drawing 2 a turn), Crustle finishes.
+
+GRASS AWARENESS (the thing the v1 agent gets wrong)
+---------------------------------------------------
+Superb Scissors costs {G}{C}{C}. The deck runs 13 Energy but only *five* of
+them provide {G}: 4 Grow Grass + 1 Basic {G}. Mist and Spiky are both {C}. So
+`len(energies) >= 3` is NOT the same as "Crustle can attack" -- a Crustle
+holding Mist/Mist/Spiky is a 3-energy brick. `_can_attack` checks for a {G}
+source, and the attach scoring routes a Grass source to the build target
+first, then switches to preferring Mist (which plugs the effect-damage hole in
+Mysterious Rock Inn) once the {G} requirement is covered.
+
+TWO NAMED THREATS
+-----------------
+  * Froslass (104) / Snorunt (103, 860): Freezing Shroud puts a damage counter
+    on every Pokemon with an Ability each Checkup. Crustle has an Ability, so
+    Froslass chips straight through the ex-damage wall -- the one card that
+    beats the gameplan by ignoring it. At 90/60/70 HP it is inside Superb
+    Scissors, so Boss's Orders onto it is the priority use of the card.
+  * Fighting Pokemon: Kangaskhan is {C} with Fighting x2 weakness and gives up
+    3 prizes, so a fresh one into a Fighting board is heavily suppressed.
+
+SCORE BANDS (keep new constants inside these)
+---------------------------------------------
+    3000        Run Errand (free draw 2, always first)
+    2000-2600   high-priority setup: evolve to Crustle, cape it, Switch to a
+                ready one, Boss with a real target, Bianca saving a wall
+    1000-1900   ordinary setup: items, supporters, secondary attachments
+     600- 999   playable but low value
+     300- 500   attacks (they end the turn, so they sit under all setup)
+         100    END
+          < 0   suppressed -- only returned when minCount forces it
+"""
+
+import os as _os
 
 from ptcg.api import (
     Observation,
@@ -15,7 +73,7 @@ from ptcg.api import (
     OptionType,
     SelectContext,
     AreaType,
-    CardType,
+    EnergyType,
     Pokemon,
     Card,
     State,
@@ -23,39 +81,83 @@ from ptcg.api import (
     SelectData,
 )
 
-# Card IDs
+# ── Card IDs (Card_ID_List_EN.pdf) ────────────────────────────────────────
 BASIC_GRASS_ENERGY = 1
-MIST_ENERGY = 11
-GROW_GRASS_ENERGY = 18
+MIST_ENERGY = 11               # TEF 161 -- {C}, blanks attack *effects*
+SPIKY_ENERGY = 14              # JTG 159 -- {C}, 2 counters back
+GROW_GRASS_ENERGY = 18         # POR 86  -- {G}, +20 HP on a {G} Pokemon
+
+SNORUNT_TWM = 103
+FROSLASS_TWM = 104             # Freezing Shroud
+SNORUNT_ASC = 860
 DWEBBLE = 344
 CRUSTLE = 345
 MEGA_KANGASKHAN_EX = 756
+
+BUDDY_BUDDY_POFFIN = 1086
+CRUSHING_HAMMER = 1120
 ULTRA_BALL = 1121
 POKEGEAR_3 = 1122
-JUMBO_ICE_CREAM = 1147
-BOSSS_ORDERS = 1182
-TEAM_ROCKETS_PETREL = 1219
-LILLIES_DETERMINATION = 1227
-BUDDY_BUDDY_POFFIN = 1086
-SUPER_POTION = 1112
-HILDA = 1225
 SWITCH = 1123
+JUMBO_ICE_CREAM = 1147
 HEROS_CAPE = 1159
-MORTYS_CONVICTION = 1187
+BOSSS_ORDERS = 1182
+ERI = 1186
+BIANCAS_DEVOTION = 1190
 XEROSICS_MACHINATIONS = 1197
+TEAM_ROCKETS_PETREL = 1219
+HILDA = 1225
+LILLIES_DETERMINATION = 1227
+COMMUNITY_CENTER = 1242
+FESTIVAL_GROUNDS = 1245
 TEAM_ROCKETS_FACTORY = 1257
 
-CRUSTLE_SWITCH_IN_ENERGY_THRESHOLD = 3
+CRUSTLE_LINE_IDS = (DWEBBLE, CRUSTLE)
+FROSLASS_LINE_IDS = (SNORUNT_TWM, FROSLASS_TWM, SNORUNT_ASC)
+STADIUM_IDS = (TEAM_ROCKETS_FACTORY, COMMUNITY_CENTER, FESTIVAL_GROUNDS)
+ENERGY_IDS = (BASIC_GRASS_ENERGY, MIST_ENERGY, SPIKY_ENERGY, GROW_GRASS_ENERGY)
+GRASS_SOURCE_IDS = (BASIC_GRASS_ENERGY, GROW_GRASS_ENERGY)
 
-# Deck loading
-import os as _os
+# Attack IDs, read off all_attack().
+ASCENSION = 478                # Dwebble  {C}   -- fetch Crustle from deck
+SUPERB_SCISSORS = 479          # Crustle  {G}{C}{C} 120
+RAPID_FIRE_COMBO = 1092        # Kangaskhan {C}{C}{C} 200+
 
-# __file__ is heuristics/crustle_agent/crustle_agent.py, so deck.csv (at the
-# project root, alongside the other training scripts) is two directories up.
-_project_root = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
-_deck_path = _os.path.join(_project_root, "deck.csv")
-with open(_deck_path) as _f:
-    deck: list[int] = [int(line) for line in _f.readlines() if line.strip()]
+CRUSTLE_ATTACK_DAMAGE = 120
+KANGASKHAN_ATTACK_DAMAGE = 200
+CRUSTLE_ATTACK_COST = 3
+MAX_USEFUL_ENERGY = 4          # don't stack a 5th Energy on anything
+MAX_CRUSTLE_LINE_IN_PLAY = 2
+MAX_KANGASKHAN_IN_PLAY = 1
+
+
+# ── Deck loading ──────────────────────────────────────────────────────────
+def _read_deck() -> list[int]:
+    """deck.csv shipped next to this module, with the Kaggle submission path
+    and the project-root crustle_deck.csv as fallbacks.
+
+    Deliberately no bare cwd-relative "deck.csv" in this list: the version
+    this file replaced loaded exactly that, which from the repo root is a
+    completely different archetype's list. It only surfaces on the
+    deck-submission call, so it fails silently rather than loudly. Better to
+    raise than to hand back 60 cards from another deck.
+    """
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    root = _os.path.dirname(_os.path.dirname(here))
+    for path in (
+        _os.path.join(here, "deck.csv"),
+        "/kaggle_simulations/agent/deck.csv",
+        _os.path.join(root, "crustle_deck.csv"),
+    ):
+        if _os.path.exists(path):
+            with open(path) as f:
+                cards = [int(line) for line in f.readlines() if line.strip()]
+            if len(cards) >= 60:
+                return cards[:60]
+    raise FileNotFoundError("crustle_agent: could not locate a 60-card deck.csv")
+
+
+deck: list[int] = _read_deck()
 
 
 def set_deck(deck_list: list[int]) -> None:
@@ -64,355 +166,930 @@ def set_deck(deck_list: list[int]) -> None:
     deck = deck_list
 
 
+# ── Card database (optional) ──────────────────────────────────────────────
+# Used only to reason about the *opponent's* cards -- HP, prize value,
+# Fighting typing. Every consumer degrades to a neutral answer when it is
+# unavailable, so the agent still plays a coherent game without it.
+try:
+    from ptcg.api import all_card_data
+
+    CARD_DB = {c.cardId: c for c in all_card_data()}
+except Exception:  # pragma: no cover - engine not importable
+    CARD_DB = {}
+
+
+def _prize_value(card_id) -> int:
+    data = CARD_DB.get(card_id)
+    if data is None:
+        return 1
+    if getattr(data, "megaEx", False):
+        return 3
+    if getattr(data, "ex", False):
+        return 2
+    return 1
+
+
+def _is_ex(card_id) -> bool:
+    """ex or Mega Evolution ex -- i.e. an attacker Crustle walls completely."""
+    data = CARD_DB.get(card_id)
+    return bool(data) and (getattr(data, "ex", False) or getattr(data, "megaEx", False))
+
+
+def _is_fighting(card_id) -> bool:
+    data = CARD_DB.get(card_id)
+    return bool(data) and getattr(data, "energyType", None) == EnergyType.FIGHTING
+
+
+def _weakness(card_id):
+    data = CARD_DB.get(card_id)
+    return getattr(data, "weakness", None) if data else None
+
+
+# ── Safe accessors ────────────────────────────────────────────────────────
 def _get_card(
     obs: Observation, area: AreaType, index: int, player_index: int
 ) -> Pokemon | Card | None:
+    """Pull a Card/Pokemon out of a zone, returning None instead of raising on
+    any out-of-range or missing-zone combination."""
     current = obs.current
     if current is None or index is None or area is None:
         return None
 
     if area == AreaType.DECK:
-        if obs.select and obs.select.deck and 0 <= index < len(obs.select.deck):
-            return obs.select.deck[index]
+        deck_cards = obs.select.deck if obs.select else None
+        if deck_cards and 0 <= index < len(deck_cards):
+            return deck_cards[index]
         return None
+    if area == AreaType.STADIUM:
+        return current.stadium[index] if 0 <= index < len(current.stadium) else None
+    if area == AreaType.LOOKING:
+        looking = current.looking
+        return looking[index] if looking and 0 <= index < len(looking) else None
 
     if player_index is None or not (0 <= player_index < len(current.players)):
         return None
     ps: PlayerState = current.players[player_index]
 
-    if area == AreaType.HAND:
-        if ps.hand is not None and 0 <= index < len(ps.hand):
-            return ps.hand[index]
+    zone = {
+        AreaType.HAND: ps.hand,
+        AreaType.DISCARD: ps.discard,
+        AreaType.ACTIVE: ps.active,
+        AreaType.BENCH: ps.bench,
+        AreaType.PRIZE: ps.prize,
+    }.get(area)
+    if zone is None or not (0 <= index < len(zone)):
         return None
-    if area == AreaType.DISCARD:
-        if 0 <= index < len(ps.discard):
-            return ps.discard[index]
+    return zone[index]
+
+
+def _active(ps: PlayerState) -> Pokemon | None:
+    return ps.active[0] if ps and ps.active and ps.active[0] else None
+
+
+def _card_id(card) -> int | None:
+    return getattr(card, "id", None)
+
+
+def _hand_ids(ps: PlayerState) -> list[int]:
+    return [c.id for c in (ps.hand or []) if c is not None]
+
+
+def _damage_on(mon: Pokemon) -> int:
+    if mon is None or mon.hp is None or mon.maxHp is None:
+        return 0
+    return max(0, mon.maxHp - mon.hp)
+
+
+def _has_grass(mon: Pokemon) -> bool:
+    """Does this Pokemon have a {G} source attached? RAINBOW counts as any
+    type, so it satisfies the {G} half of Superb Scissors too."""
+    return any(
+        e in (EnergyType.GRASS, EnergyType.RAINBOW) for e in (mon.energies or [])
+    )
+
+
+def _can_attack(mon: Pokemon) -> bool:
+    """Crustle readiness: 3 Energy *including a {G} source*. See the module
+    docstring -- three colourless Energy is a brick, not an attacker."""
+    if mon is None or mon.id != CRUSTLE:
+        return False
+    return len(mon.energies or []) >= CRUSTLE_ATTACK_COST and _has_grass(mon)
+
+
+def _damage_vs(attacker_damage: int, defender: Pokemon, attack_type) -> int:
+    """Weakness-adjusted damage. Resistance is ignored -- it is a flat -20 or
+    -30 and never flips a KO check that Weakness didn't already decide."""
+    if defender is None:
+        return attacker_damage
+    if _weakness(defender.id) == attack_type:
+        return attacker_damage * 2
+    return attacker_damage
+
+
+def _crustle_kos(defender: Pokemon) -> bool:
+    if defender is None or defender.hp is None:
+        return False
+    return _damage_vs(CRUSTLE_ATTACK_DAMAGE, defender, EnergyType.GRASS) >= defender.hp
+
+
+# ── Board view ────────────────────────────────────────────────────────────
+class _Board:
+    """Everything the scorers need, computed once per agent() call."""
+
+    def __init__(self, obs: Observation, current: State, your_index: int):
+        self.obs = obs
+        self.current = current
+        self.me = your_index
+        self.opp = 1 - your_index
+        self.ps: PlayerState = current.players[your_index]
+        self.ops: PlayerState = current.players[self.opp]
+
+        self.active = _active(self.ps)
+        self.active_id = _card_id(self.active)
+        self.opp_active = _active(self.ops)
+        self.hand_ids = _hand_ids(self.ps)
+
+        self.stadium_id = current.stadium[0].id if current.stadium else None
+        self.stadium_owner = (
+            current.stadium[0].playerIndex if current.stadium else None
+        )
+        self.factory = self.stadium_id == TEAM_ROCKETS_FACTORY
+
+        # (area, index, mon) for every Dwebble/Crustle we control.
+        self.line: list[tuple[AreaType, int, Pokemon]] = []
+        if self.active is not None and self.active_id in CRUSTLE_LINE_IDS:
+            self.line.append((AreaType.ACTIVE, 0, self.active))
+        for i, mon in enumerate(self.ps.bench or []):
+            if mon is not None and mon.id in CRUSTLE_LINE_IDS:
+                self.line.append((AreaType.BENCH, i, mon))
+
+        self.line_count = len(self.line)
+        self.kangaskhan_count = sum(
+            1
+            for mon in ([self.active] if self.active else []) + list(self.ps.bench or [])
+            if mon is not None and mon.id == MEGA_KANGASKHAN_EX
+        )
+
+        self.active_ready = _can_attack(self.active)
+        self.ready_bench = [
+            (area, idx, mon)
+            for area, idx, mon in self.line
+            if area == AreaType.BENCH and _can_attack(mon)
+        ]
+        # The wall is built but stuck behind something else -- Switch time.
+        self.stuck = bool(self.ready_bench) and not self.active_ready
+
+        self.build_target = self._pick_build_target()
+
+        # Opponent read.
+        self.opp_board = [m for m in ([self.opp_active] + list(self.ops.bench or [])) if m]
+        self.opp_bench = [m for m in (self.ops.bench or []) if m]
+        self.opp_has_fighting = any(_is_fighting(m.id) for m in self.opp_board)
+        self.opp_froslass = any(m.id in FROSLASS_LINE_IDS for m in self.opp_board)
+        self.opp_has_energy = any(len(m.energies or []) > 0 for m in self.opp_board)
+        self.opp_hand_count = self.ops.handCount or 0
+        # Non-ex attackers are the only opposing Pokemon that can damage the
+        # wall at all, so they are what Boss's Orders wants gone.
+        self.opp_threats = [m for m in self.opp_board if not _is_ex(m.id)]
+
+    def _pick_build_target(self):
+        """Which line member the once-per-turn Energy should go on.
+
+        Crustle before Dwebble, then the one closest to attacking, then the
+        Active (it can attack the soonest). Returns None when every line
+        member is already able to attack, or when there is no line in play.
+        """
+        candidates = [
+            (area, idx, mon) for area, idx, mon in self.line if not _can_attack(mon)
+        ]
+        if not candidates:
+            # Every line member can already attack (so every one of them has
+            # its {G}). Topping one up is still better than feeding
+            # Kangaskhan, but only up to MAX_USEFUL_ENERGY.
+            candidates = [
+                (area, idx, mon)
+                for area, idx, mon in self.line
+                if len(mon.energies or []) < MAX_USEFUL_ENERGY
+            ]
+        if not candidates:
+            return None
+        return max(
+            candidates,
+            key=lambda t: (
+                t[2].id == CRUSTLE,
+                len(t[2].energies or []),
+                t[0] == AreaType.ACTIVE,
+            ),
+        )
+
+    def is_build_target(self, area, index) -> bool:
+        if self.build_target is None:
+            return False
+        return self.build_target[0] == area and self.build_target[1] == index
+
+    def in_play(self, area, index) -> Pokemon | None:
+        if area == AreaType.ACTIVE:
+            return self.active if index in (0, None) else None
+        if area == AreaType.BENCH:
+            bench = self.ps.bench or []
+            return bench[index] if index is not None and 0 <= index < len(bench) else None
         return None
+
+    def wants_ice_cream(self) -> bool:
+        """Active is hurt enough for Jumbo Ice Cream to be worth a card, and
+        meets its 3-Energy requirement."""
+        return (
+            self.active is not None
+            and len(self.active.energies or []) >= 3
+            and _damage_on(self.active) >= 40
+        )
+
+    def needs_crustle_in_hand(self) -> bool:
+        """A Dwebble is in play with nothing to evolve it into."""
+        return any(mon.id == DWEBBLE for _, _, mon in self.line) and (
+            CRUSTLE not in self.hand_ids
+        )
+
+    def cape_in_play(self) -> bool:
+        return any(
+            any(t.id == HEROS_CAPE for t in (mon.tools or []))
+            for _, _, mon in self.line
+        )
+
+    def best_boss_target(self) -> tuple[Pokemon | None, int]:
+        """(target, value) for the best Boss's Orders drag off their bench."""
+        best, best_value = None, 0
+        for mon in self.opp_bench:
+            value = self.boss_value(mon)
+            if value > best_value:
+                best, best_value = mon, value
+        return best, best_value
+
+    def boss_value(self, mon: Pokemon) -> int:
+        """How much we want this Pokemon dragged into the Active Spot."""
+        if mon is None:
+            return 0
+        value = 0
+        if mon.id in FROSLASS_LINE_IDS:
+            # The one line that ignores Mysterious Rock Inn. Kill it on sight.
+            value += 2000
+        if _crustle_kos(mon):
+            value += 600 + 200 * _prize_value(mon.id)
+        if not _is_ex(mon.id):
+            # Non-ex bodies are the only ones that can damage the wall.
+            value += 300
+        value += 25 * len(mon.energies or [])
+        return value
+
+
+# ── How badly we want each card ───────────────────────────────────────────
+def _want(card_id: int, b: _Board) -> int:
+    """Value of adding this card to hand right now.
+
+    Drives every search (Petrel, Hilda, Ultra Ball, Pokegear, Poffin) and,
+    inverted, every discard. Situational so the same card scores differently
+    early and late.
+    """
+    if card_id == CRUSTLE:
+        return 1000 if b.needs_crustle_in_hand() else 600
+    if card_id == DWEBBLE:
+        return 800 if b.line_count == 0 else (450 if b.line_count < 2 else 100)
+    if card_id == SWITCH:
+        return 1100 if b.stuck else 250
+    if card_id == JUMBO_ICE_CREAM:
+        return 900 if b.wants_ice_cream() else 300
+    if card_id == BIANCAS_DEVOTION:
+        return 900 if any(m.hp is not None and m.hp <= 30 for _, _, m in b.line) else 200
+    if card_id == HEROS_CAPE:
+        return 700 if (b.line_count > 0 and not b.cape_in_play()) else 200
+    if card_id == GROW_GRASS_ENERGY:
+        # The {G} half of Superb Scissors, and only 5 sources in 60 cards.
+        if b.build_target is not None and not _has_grass(b.build_target[2]):
+            return 850
+        return 400
+    if card_id == BASIC_GRASS_ENERGY:
+        if b.build_target is not None and not _has_grass(b.build_target[2]):
+            return 700
+        return 200
+    if card_id == MIST_ENERGY:
+        return 450
+    if card_id == SPIKY_ENERGY:
+        return 250
+    if card_id == BOSSS_ORDERS:
+        return 700 if b.best_boss_target()[1] >= 600 else 300
+    if card_id == BUDDY_BUDDY_POFFIN:
+        return 750 if b.line_count < MAX_CRUSTLE_LINE_IN_PLAY else 120
+    if card_id == HILDA:
+        return 700 if b.needs_crustle_in_hand() else 350
+    if card_id == TEAM_ROCKETS_PETREL:
+        return 500 + (100 if b.factory else 0)
+    if card_id == ULTRA_BALL:
+        return 550 if b.line_count == 0 else 200
+    if card_id == POKEGEAR_3:
+        return 350
+    if card_id == CRUSHING_HAMMER:
+        return 350 if b.opp_has_energy else 150
+    if card_id == XEROSICS_MACHINATIONS:
+        return 500 if b.opp_hand_count >= 6 else 150
+    if card_id == ERI:
+        return 400 if b.opp_hand_count >= 5 else 150
+    if card_id == LILLIES_DETERMINATION:
+        return 400 if len(b.hand_ids) <= 3 else 150
+    if card_id in STADIUM_IDS:
+        return 300 if b.stadium_owner == b.opp else 180
+    if card_id == MEGA_KANGASKHAN_EX:
+        # Exactly one is the plan; a second is 3 more prizes on the table.
+        return 600 if b.kangaskhan_count == 0 else 60
+    return 200
+
+
+# ── MAIN-turn scoring ─────────────────────────────────────────────────────
+def _score_ability(o, b: _Board) -> int:
+    card = _get_card(b.obs, o.area, o.index, b.me)
+    if _card_id(card) == MEGA_KANGASKHAN_EX:
+        # Run Errand: free draw 2. Always first -- more cards means better
+        # choices for every action below. Held back only when the extra draw
+        # would eat the last of the deck.
+        return 400 if (b.ps.deckCount or 0) <= 2 else 3000
+    return 900
+
+
+def _score_attach(o, b: _Board) -> int:
+    card = _get_card(b.obs, o.area, o.index, b.me)
+    cid = _card_id(card)
+    target = b.in_play(o.inPlayArea, o.inPlayIndex)
+    if target is None:
+        return -10
+
+    if cid == HEROS_CAPE:
+        # +100 HP. Tools survive evolution, so a Dwebble that is about to
+        # become Crustle is a fine home for it.
+        if any(t.id == HEROS_CAPE for t in (target.tools or [])):
+            return -10
+        if target.id == CRUSTLE:
+            return 2450
+        if target.id == DWEBBLE:
+            return 2200
+        # Dead weight on Kangaskhan unless the line never showed up.
+        return 700 if b.line_count == 0 else -10
+
+    if cid not in ENERGY_IDS:
+        return 900  # unknown tool: play it somewhere sane
+
+    # The Energy cap must never block the {G} source Superb Scissors needs.
+    # A line member holding four colourless Energy is a brick, and suppressing
+    # the Grow Grass attach onto it would strand it permanently.
+    fixes_grass = (
+        target.id in CRUSTLE_LINE_IDS
+        and not _has_grass(target)
+        and cid in GRASS_SOURCE_IDS
+    )
+    if len(target.energies or []) >= MAX_USEFUL_ENERGY and not fixes_grass:
+        return -10
+
+    # Energy card preference. Cover the {G} requirement first, then Mist
+    # (which plugs the effect-damage hole in Mysterious Rock Inn), then Spiky.
+    if target.id in CRUSTLE_LINE_IDS and not _has_grass(target):
+        card_bonus = {
+            GROW_GRASS_ENERGY: 120,
+            BASIC_GRASS_ENERGY: 100,
+            MIST_ENERGY: 20,
+            SPIKY_ENERGY: 10,
+        }.get(cid, 0)
+    else:
+        card_bonus = {
+            MIST_ENERGY: 100,
+            GROW_GRASS_ENERGY: 80,
+            SPIKY_ENERGY: 50,
+            BASIC_GRASS_ENERGY: 20,
+        }.get(cid, 0)
+
+    if b.is_build_target(o.inPlayArea, o.inPlayIndex):
+        return 2100 + card_bonus
+    if target.id in CRUSTLE_LINE_IDS:
+        return 1400 + card_bonus
+    if target.id == MEGA_KANGASKHAN_EX:
+        # Only when no line member wants it -- otherwise this is the single
+        # worst attachment in the deck.
+        return -10 if b.build_target is not None else 900 + card_bonus
+    return 800 + card_bonus
+
+
+def _score_evolve(o, b: _Board) -> int:
+    card = _get_card(b.obs, o.area, o.index, b.me)
+    if _card_id(card) == CRUSTLE:
+        target = b.in_play(o.inPlayArea, o.inPlayIndex)
+        # Prefer evolving the Dwebble that already carries the Energy.
+        bonus = 20 * len(target.energies or []) if target else 0
+        return 2600 + bonus
+    return 800
+
+
+def _score_play(o, b: _Board) -> int:
+    card = _get_card(b.obs, AreaType.HAND, o.index, b.me)
+    cid = _card_id(card)
+    if cid is None:
+        return 700
+
+    # ── Pokemon ───────────────────────────────────────────────────────────
+    if cid == DWEBBLE:
+        return 1800 if b.line_count < MAX_CRUSTLE_LINE_IN_PLAY else -10
+    if cid == MEGA_KANGASKHAN_EX:
+        if b.kangaskhan_count >= MAX_KANGASKHAN_IN_PLAY:
+            return -10
+        # 300 HP halves against Fighting and hands over 3 prizes.
+        return 250 if b.opp_has_fighting else 1500
+
+    # ── Swap / heal ───────────────────────────────────────────────────────
+    if cid == SWITCH:
+        # Retreat costs 3 Energy for both walls, so this is the real swap.
+        return 2300 if b.stuck else -10
+    if cid == JUMBO_ICE_CREAM:
+        if b.active is None or len(b.active.energies or []) < 3:
+            return -10
+        damage = _damage_on(b.active)
+        if damage >= 70:
+            return 1900          # at or near the full 80
+        if damage >= 40:
+            return 950
+        return -10               # 4 copies; don't burn one to heal 20
+    if cid == BIANCAS_DEVOTION:
+        # Full-heals a Pokemon at <=30 HP remaining -- saves a built wall.
+        savable = [
+            m for m in ([b.active] if b.active else []) + list(b.ps.bench or [])
+            if m is not None and m.hp is not None and m.hp <= 30
+        ]
+        if not savable:
+            return -10
+        return 2350 if any(m.id in CRUSTLE_LINE_IDS for m in savable) else 1300
+
+    # ── Targeting ─────────────────────────────────────────────────────────
+    if cid == BOSSS_ORDERS:
+        if not b.opp_bench:
+            return -10
+        _, value = b.best_boss_target()
+        if value >= 2000:
+            return 2500          # Froslass -- the deck's only real out
+        # Only worth the turn's Supporter if something can convert it.
+        can_convert = b.active_ready or b.stuck
+        if value >= 600:
+            return 2200 if can_convert else 1000
+        return 300
+
+    # ── Search ────────────────────────────────────────────────────────────
+    if cid == TEAM_ROCKETS_PETREL:
+        # Searches any Trainer, so it is whichever piece we are missing.
+        score = 1200 + (150 if b.factory else 0)
+        if b.stuck and SWITCH not in b.hand_ids:
+            score = 2250         # go get the Switch
+        elif b.wants_ice_cream() and JUMBO_ICE_CREAM not in b.hand_ids:
+            score = 1900
+        elif b.line_count == 0:
+            score = 1700         # fetch Poffin / Ultra Ball to find the line
+        return score
+    if cid == HILDA:
+        # Evolution Pokemon + an Energy card: Crustle plus Grow Grass.
+        return 2000 if b.needs_crustle_in_hand() else 1100
+    if cid == BUDDY_BUDDY_POFFIN:
+        # Dwebble is 70 HP so it is a legal target; Kangaskhan at 300 is not.
+        return 2050 if b.line_count < MAX_CRUSTLE_LINE_IN_PLAY else -10
+    if cid == ULTRA_BALL:
+        # Costs 2 cards -- only when the board actually needs a body.
+        if b.line_count == 0 or b.needs_crustle_in_hand():
+            return 1500
+        return -10 if len(b.hand_ids) <= 3 else 400
+    if cid == POKEGEAR_3:
+        supporters_in_hand = any(
+            c in (
+                BOSSS_ORDERS, HILDA, TEAM_ROCKETS_PETREL, LILLIES_DETERMINATION,
+                ERI, XEROSICS_MACHINATIONS, BIANCAS_DEVOTION,
+            )
+            for c in b.hand_ids
+        )
+        return 800 if supporters_in_hand else 1450
+
+    # ── Draw / disruption ─────────────────────────────────────────────────
+    if cid == LILLIES_DETERMINATION:
+        # Shuffles the hand away for 6 (8 at exactly 6 Prizes), so its cost is
+        # everything it throws away. hand_ids still contains Lillie itself.
+        discarded = max(0, len(b.hand_ids) - 1)
+        if discarded <= 1:
+            return 2000
+        if discarded <= 3:
+            return 1250
+        if discarded <= 5:
+            return 500
+        return -10
+    if cid == XEROSICS_MACHINATIONS:
+        if b.opp_hand_count >= 7:
+            return 1600
+        if b.opp_hand_count >= 5:
+            return 1000
+        return -10
+    if cid == ERI:
+        if b.opp_hand_count >= 5:
+            return 1350
+        if b.opp_hand_count >= 3:
+            return 800
+        return -10
+    if cid == CRUSHING_HAMMER:
+        return 1050 if b.opp_has_energy else -10
+
+    # ── Stadiums ──────────────────────────────────────────────────────────
+    if cid in STADIUM_IDS:
+        if b.stadium_id == cid and b.stadium_owner == b.me:
+            return -10           # already ours, replacing it does nothing
+        # Bumping the opponent's stadium is worth more than playing into open
+        # space, since theirs is presumably doing something for them.
+        score = 1600 if (b.stadium_id is not None and b.stadium_owner == b.opp) else 1000
+        if cid == COMMUNITY_CENTER and any(
+            _damage_on(m) > 0
+            for m in ([b.active] if b.active else []) + list(b.ps.bench or [])
+            if m
+        ):
+            score += 250         # heal 10 across a 250+ HP board adds up
+        if cid == TEAM_ROCKETS_FACTORY and TEAM_ROCKETS_PETREL in b.hand_ids:
+            score += 200         # Petrel has "Team Rocket" in its name
+        if cid == FESTIVAL_GROUNDS and (
+            b.ps.poisoned or b.ps.burned or b.ps.asleep
+            or b.ps.paralyzed or b.ps.confused
+        ):
+            score += 400         # status is the other hole in the wall
+        return score
+
+    return 700
+
+
+def _score_retreat(b: _Board) -> int:
+    """Retreating discards the retreat cost in Energy (3 for both walls), so
+    it is normally strictly worse than Switch. The exception is Kangaskhan:
+    Energy on it is dead weight anyway, so paying with it to get the built
+    Crustle in front is fine."""
+    if b.active is None:
+        return -3
+    if b.active_id == CRUSTLE:
+        return -5                # never throw away the investment
+    if b.stuck and SWITCH not in b.hand_ids:
+        if b.active_id == MEGA_KANGASKHAN_EX:
+            return 1300
+        return 1100              # Dwebble, retreat cost 2
+    return -3
+
+
+def _score_attack(o, b: _Board) -> int:
+    """Attacks end the turn, so the whole band sits under every setup action."""
+    attack_id = o.attackId
+
+    if attack_id == SUPERB_SCISSORS:
+        return 500 if _crustle_kos(b.opp_active) else 400
+
+    if attack_id == ASCENSION:
+        # 0 damage, but it evolves straight out of the deck -- by far the best
+        # thing a Dwebble stuck in the Active Spot can be doing.
+        if CRUSTLE in b.hand_ids:
+            return 200           # a manual evolve was free; something blocked it
+        return 450 if b.line_count <= MAX_CRUSTLE_LINE_IN_PLAY else 200
+
+    if attack_id == RAPID_FIRE_COMBO:
+        score = 350 if (
+            b.opp_active is not None
+            and b.opp_active.hp is not None
+            and _damage_vs(KANGASKHAN_ATTACK_DAMAGE, b.opp_active, EnergyType.COLORLESS)
+            >= b.opp_active.hp
+        ) else 250
+        if b.ready_bench:
+            # We should have swapped instead of exposing the 3-prize body.
+            score -= 120
+        return score
+
+    return 300
+
+
+def _score_main(o, b: _Board) -> int:
+    if o.type == OptionType.ABILITY:
+        return _score_ability(o, b)
+    if o.type == OptionType.ATTACH:
+        return _score_attach(o, b)
+    if o.type == OptionType.EVOLVE:
+        return _score_evolve(o, b)
+    if o.type == OptionType.PLAY:
+        return _score_play(o, b)
+    if o.type == OptionType.RETREAT:
+        return _score_retreat(b)
+    if o.type == OptionType.ATTACK:
+        return _score_attack(o, b)
+    if o.type == OptionType.DISCARD:
+        return -10               # discarding our own in-play card is never the plan
+    if o.type == OptionType.END:
+        return 100
+    return 0
+
+
+# ── Sub-selection scoring ─────────────────────────────────────────────────
+# Everything here starts from a solid positive base so the agent always makes
+# a *valid* choice and the game keeps moving (the notebook's rule), then adds
+# deck-specific preferences on top.
+_SUB_BASE = 2000
+
+# Contexts where the selected card is being taken away from its owner. When
+# the options are ours we pick the fewest and cheapest; when they are the
+# opponent's we pick the most and most expensive.
+_COST_CONTEXTS = frozenset(
+    {
+        SelectContext.DISCARD,
+        SelectContext.DISCARD_CARD_OR_ATTACHED_CARD,
+        SelectContext.DISCARD_ENERGY,
+        SelectContext.DISCARD_ENERGY_CARD,
+        SelectContext.DISCARD_TOOL_CARD,
+        SelectContext.TO_DECK,
+        SelectContext.TO_DECK_BOTTOM,
+        SelectContext.TO_PRIZE,
+        SelectContext.DEVOLVE,
+    }
+)
+
+_SEARCH_CONTEXTS = frozenset(
+    {
+        SelectContext.TO_HAND,
+        SelectContext.TO_FIELD,
+        SelectContext.LOOK,
+        SelectContext.EVOLVES_TO,
+    }
+)
+
+
+def _energy_card_at(b: _Board, o) -> int | None:
+    """Card id behind an ENERGY / ENERGY_CARD option (they address a Pokemon
+    by area+index and then an energyIndex into its attached Energy)."""
+    if o.playerIndex is not None and o.playerIndex != b.me:
+        return None
+    mon = b.in_play(o.area, o.index)
+    if mon is None or o.energyIndex is None:
+        return None
+    cards = mon.energyCards or []
+    return cards[o.energyIndex].id if 0 <= o.energyIndex < len(cards) else None
+
+
+def _mon_at(current: State, player_index, area, index) -> Pokemon | None:
+    """A Pokemon in play on either side, addressed the way options address it."""
+    if player_index is None or not (0 <= player_index < len(current.players)):
+        return None
+    ps = current.players[player_index]
     if area == AreaType.ACTIVE:
-        if 0 <= index < len(ps.active):
-            return ps.active[index]
+        zone = ps.active
+    elif area == AreaType.BENCH:
+        zone = ps.bench
+    else:
         return None
-    if area == AreaType.BENCH:
-        if 0 <= index < len(ps.bench):
-            return ps.bench[index]
+    if index is None or not (0 <= index < len(zone or [])):
         return None
-    if area == AreaType.PRIZE:
-        if 0 <= index < len(ps.prize):
-            return ps.prize[index]
-        return None
-    if area == AreaType.STADIUM:
-        if 0 <= index < len(current.stadium):
-            return current.stadium[index]
-        return None
-    if area == AreaType.LOOKING:
-        if current.looking and 0 <= index < len(current.looking):
-            return current.looking[index]
-        return None
-    return None
+    return zone[index]
 
 
-def _stadium_id(current: State) -> int | None:
-    return current.stadium[0].id if current.stadium else None
+def _score_sub(o, b: _Board | None, context, sel: SelectData, obs: Observation) -> int:
+    score = _SUB_BASE
+
+    # ── Yes/No ────────────────────────────────────────────────────────────
+    if o.type == OptionType.YES:
+        if context == SelectContext.IS_FIRST:
+            # A wall deck wants the extra setup turn far more than it wants
+            # the turn-1 attack it cannot make anyway.
+            return score + 500
+        return score + 100
+    if o.type == OptionType.NO:
+        return score
+    if o.type == OptionType.NUMBER:
+        return score + (o.number or 0)
+    if o.type == OptionType.SPECIAL_CONDITION:
+        return score
+
+    if b is None:
+        return score
+
+    # ── Attached Energy (retreat cost, Crushing Hammer, ...) ──────────────
+    if o.type in (OptionType.ENERGY, OptionType.ENERGY_CARD):
+        if o.playerIndex is not None and o.playerIndex != b.me:
+            # Their Energy: strip from whoever is most invested, Active first.
+            mon = _mon_at(b.current, o.playerIndex, o.area, o.index)
+            score += 300
+            score += 40 * len(mon.energies or []) if mon is not None else 0
+            score += 200 if o.area == AreaType.ACTIVE else 0
+            return score
+        cid = _energy_card_at(b, o)
+        # Ours, and about to be discarded: shed the least useful first, and
+        # hang on to the {G} sources Superb Scissors needs.
+        keep = {
+            GROW_GRASS_ENERGY: 400,
+            BASIC_GRASS_ENERGY: 350,
+            MIST_ENERGY: 250,
+            SPIKY_ENERGY: 120,
+        }.get(cid, 200)
+        return score + (500 - keep)
+    if o.type == OptionType.TOOL_CARD:
+        return score
+    if o.type == OptionType.SKILL:
+        return score
+
+    if o.type != OptionType.CARD:
+        return score
+
+    owner = o.playerIndex if o.playerIndex is not None else b.me
+    card = _get_card(obs, o.area, o.index, owner)
+    if card is None:
+        return score
+    cid = card.id
+    mine = owner == b.me
+    effect_id = _card_id(sel.effect)
+
+    # ── Cards being taken away ────────────────────────────────────────────
+    if context in _COST_CONTEXTS:
+        if not mine:
+            # Eri and friends: hit their best stuff.
+            return score + 400 + _want(cid, b)
+        # Ultra Ball's cost, hand-size trims: invert the want table so the
+        # least useful card is the one that goes.
+        return score + max(0, 1100 - _want(cid, b))
+
+    # ── Opening board ─────────────────────────────────────────────────────
+    if context == SelectContext.SETUP_ACTIVE_POKEMON:
+        # Kangaskhan leads: a 300 HP body that draws 2 a turn while the bench
+        # develops. Leading a Dwebble puts a 70 HP starter in the firing line.
+        return score + (900 if cid == MEGA_KANGASKHAN_EX else 100)
+    if context in (SelectContext.SETUP_BENCH_POKEMON, SelectContext.TO_BENCH):
+        if cid == DWEBBLE:
+            return score + (900 if b.line_count < MAX_CRUSTLE_LINE_IN_PLAY else 150)
+        if cid == MEGA_KANGASKHAN_EX:
+            return score + (400 if b.kangaskhan_count == 0 else 50)
+        return score + 200
+
+    # ── Bringing something to the Active Spot ─────────────────────────────
+    if context in (SelectContext.SWITCH, SelectContext.TO_ACTIVE):
+        mon = card if isinstance(card, Pokemon) else None
+        if mon is not None and _can_attack(mon):
+            return score + 1200
+        if cid == CRUSTLE:
+            return score + 700
+        if cid == MEGA_KANGASKHAN_EX:
+            return score + 400
+        if cid == DWEBBLE:
+            return score + 100
+        return score + 200
+
+    # ── Searches ──────────────────────────────────────────────────────────
+    if context in _SEARCH_CONTEXTS:
+        return score + _want(cid, b)
+    if context == SelectContext.EVOLVES_FROM:
+        # Evolve the Dwebble carrying the most Energy.
+        mon = card if isinstance(card, Pokemon) else None
+        return score + 300 + 30 * (len(mon.energies or []) if mon else 0)
+    if context == SelectContext.EVOLVE:
+        return score + _want(cid, b)
+
+    # ── Healing ourselves ─────────────────────────────────────────────────
+    if context in (SelectContext.HEAL, SelectContext.REMOVE_DAMAGE_COUNTER):
+        mon = card if isinstance(card, Pokemon) else None
+        if mon is None:
+            return score
+        bonus = _damage_on(mon)
+        if mon.id in CRUSTLE_LINE_IDS:
+            bonus += 300
+        return score + bonus
+
+    # ── Pointing an effect at something ───────────────────────────────────
+    if context in (
+        SelectContext.EFFECT_TARGET,
+        SelectContext.DAMAGE,
+        SelectContext.DAMAGE_COUNTER,
+        SelectContext.DAMAGE_COUNTER_ANY,
+        SelectContext.ATTACH_FROM,
+        SelectContext.ATTACH_TO,
+        SelectContext.DETACH_FROM,
+    ):
+        mon = card if isinstance(card, Pokemon) else None
+
+        if effect_id == BOSSS_ORDERS and mon is not None:
+            return score + b.boss_value(mon)
+        if effect_id == CRUSHING_HAMMER and mon is not None and not mine:
+            # Strip from whoever is most invested; their Active first.
+            return score + 200 * len(mon.energies or []) + (
+                200 if o.area == AreaType.ACTIVE else 0
+            )
+        if effect_id == BIANCAS_DEVOTION and mon is not None and mine:
+            return score + _damage_on(mon) + (400 if mon.id in CRUSTLE_LINE_IDS else 0)
+        if effect_id == HEROS_CAPE and mon is not None and mine:
+            if mon.id == CRUSTLE:
+                return score + 800
+            if mon.id == DWEBBLE:
+                return score + 500
+            return score + 50
+        if effect_id in ENERGY_IDS and mon is not None and mine:
+            if b.is_build_target(o.area, o.index):
+                return score + 900
+            if mon.id in CRUSTLE_LINE_IDS:
+                return score + 500
+            return score + 50
+
+        if mon is not None and not mine:
+            # Generic hostile targeting, same shape as the notebook's rule:
+            # their Active first, then whoever is most invested.
+            return score + (500 if o.area == AreaType.ACTIVE else 100) + 40 * len(
+                mon.energies or []
+            )
+        if mon is not None:
+            return score + (mon.hp or 0)
+        return score + _want(cid, b)
+
+    # ── Fallback: the notebook's generic rule ─────────────────────────────
+    if isinstance(card, Pokemon):
+        if not mine:
+            return score + (500 if o.area == AreaType.ACTIVE else 100) + 50 * len(
+                card.energies or []
+            )
+        return score + (card.hp or 0)
+    return score + _want(cid, b)
 
 
-def _factory_in_play(current: State) -> bool:
-    return _stadium_id(current) == TEAM_ROCKETS_FACTORY
+def _desired_count(context, options, b: _Board | None, min_count, max_count) -> int:
+    """How many options to actually return.
 
+    'Up to N' selections are only free when the thing being selected is good
+    for us. When the engine is asking which of *our* cards to throw away we
+    take the minimum it will accept -- the notebook's version fills to
+    maxCount whenever the scores are positive, which over-discards.
 
-def _best_benched_crustle(ps: PlayerState) -> tuple[int | None, int]:
-    """Return (bench_index, energy_count) for the highest-energy benched Crustle."""
-    best_i, best_e = None, -1
-    for i, mon in enumerate(ps.bench):
-        if mon and mon.id == CRUSTLE:
-            e = len(mon.energies)
-            if e > best_e:
-                best_i, best_e = i, e
-    return best_i, max(best_e, 0)
-
-
-def _crustle_ready(ps: PlayerState) -> bool:
-    _, e = _best_benched_crustle(ps)
-    return e >= CRUSTLE_SWITCH_IN_ENERGY_THRESHOLD
-
-
-def _opponent_has_bench(current: State, your_index: int) -> bool:
-    return len(current.players[1 - your_index].bench) > 0
-
-
-def _active_id(ps: PlayerState) -> int | None:
-    return ps.active[0].id if ps.active and ps.active[0] else None
-
-
-def _active_pokemon(ps: PlayerState) -> Pokemon | None:
-    return ps.active[0] if ps.active and ps.active[0] else None
-
-
-def _crustle_line_count(ps: PlayerState) -> int:
-    """Count Dwebble + Crustle across active and bench on our side."""
-    count = 0
-    for mon in ps.active or []:
-        if mon and mon.id in (DWEBBLE, CRUSTLE):
-            count += 1
-    for mon in ps.bench or []:
-        if mon and mon.id in (DWEBBLE, CRUSTLE):
-            count += 1
-    return count
+    Eri is the reason this checks ownership rather than just the context:
+    "you discard up to 2 Item cards" arrives as a DISCARD select over the
+    *opponent's* hand, and there we do want the maximum.
+    """
+    if context in _COST_CONTEXTS and b is not None:
+        hits_opponent = any(o.playerIndex == b.opp for o in options)
+        if not hits_opponent:
+            return min_count
+    return max_count
 
 
 def agent(obs_dict: dict) -> list[int]:
+    """Score every option, return the best ones.
+
+    Priority order, highest first:
+        3000  Run Errand (Kangaskhan's free draw 2)
+        2600  Evolve Dwebble -> Crustle
+        2500  Boss's Orders onto the Froslass line
+        2450  Hero's Cape onto the Crustle line
+        2350  Bianca's Devotion saving a nearly-dead wall
+        2300  Switch to a benched Crustle that can attack
+        2250  Petrel to fetch that Switch
+        2200  Boss's Orders with a convertible target
+        2100  Energy onto the build target ({G} source first)
+        2050  Buddy-Buddy Poffin / 2000 Hilda / 2000 Lillie on an empty hand
+        1900  Jumbo Ice Cream at (near) full value
+        1800  Dwebble to the bench / 1600 stadiums / 1500 Kangaskhan
+        1050  Crushing Hammer while they have Energy
+         700  anything else playable
+         300-500  attacks (they end the turn)
+         100  END
+        <  0  suppressed unless minCount forces it
     """
-    Priority order within a main-turn select (highest score wins):
-      Switch + Hero's Cape          2200 / 2100 / 2050
-      Boss's Orders (with target)   1700
-      Hilda (when needed)           1600
-      Jumbo Ice Cream (when useful) 1500  [hp < maxHp AND 3+ energy]
-      Morty's Conviction            1400
-      Kangaskhan Ability (no Crustle ready)  1100
-      Energy attachment (to not-ready Crustle)  1050
-      Generic attachment            1000
-      Retreat (Kangaskhan -> Crustle swap)  950
-      Evolve Dwebble                850
-      Generic evolve                800
-      Generic play                  600
-      Crustle attack                150
-      Generic attack                100
-      Kangaskhan Ability (Crustle ready, de-prioritised)  300
-      OptionType.END                -2  (safe baseline)
-      Unmotivated retreat           -3
-      Suppressed PLAY/ATTACH        -10
-    """
-    select = obs_dict.get("select")
-    if select is None:
+    if obs_dict.get("select") is None:
         return deck
 
-    # Convert raw dict -> typed dataclasses once at the top.
     obs: Observation = to_observation_class(obs_dict)
     sel: SelectData = obs.select
-
     options = sel.option
     if not options:
         return []
 
     context: SelectContext = sel.context
     current: State | None = obs.current
-    your_index: int | None = current.yourIndex if current else None
+    your_index = current.yourIndex if current is not None else None
 
-    min_count = sel.minCount
     max_count = min(sel.maxCount, len(options))
-    min_count = min(min_count, max_count)
+    min_count = min(sel.minCount, max_count)
 
-    your_ps: PlayerState | None = None
-    opp_ps: PlayerState | None = None
-    factory: bool = False
-    crustle_rdy: bool = False
-
-    if current is not None and your_index is not None:
-        your_ps = current.players[your_index]
-        opp_ps = current.players[1 - your_index]
-        factory = _factory_in_play(current)
-        crustle_rdy = _crustle_ready(your_ps)
+    board: _Board | None = None
+    if current is not None and your_index is not None and len(current.players) == 2:
+        try:
+            board = _Board(obs, current, your_index)
+        except Exception:
+            board = None
 
     scores: list[int] = []
-
     for o in options:
-        score = 0
-        if context == SelectContext.MAIN and your_ps is not None:
-            active_id = _active_id(your_ps)
-            active_mon = _active_pokemon(your_ps)
-
-            if o.type == OptionType.ABILITY:
-                # Kangaskhan's Ability: use every turn until Crustle is ready.
-                if active_id == MEGA_KANGASKHAN_EX:
-                    score = 3000
-
-            elif o.type == OptionType.RETREAT:
-                # Only retreat when we want to swap Kangaskhan out for Crustle.
-                if active_id == MEGA_KANGASKHAN_EX and crustle_rdy:
-                    score = 950
-                else:
-                    score = -3
-
-            elif o.type == OptionType.ATTACH:
-                MAX_ENERGY = 4
-                target_energy = 0
-                score = 1000
-                card = _get_card(obs, o.area, o.index, your_index)
-                if o.inPlayArea == AreaType.ACTIVE and your_ps.active:
-                    target_mon = your_ps.active[0] if your_ps.active else None
-                    if target_mon:
-                        target_energy = len(target_mon.energies)
-                elif o.inPlayArea == AreaType.BENCH:
-                    bench = your_ps.bench
-                    idx = o.inPlayIndex
-                    if idx is not None and 0 <= idx < len(bench) and bench[idx]:
-                        target_energy = len(bench[idx].energies)
-                if card is not None and card.id == HEROS_CAPE:
-                    # Hero's Cape: prioritise active Crustle, then benched Crustle.
-                    if o.inPlayArea == AreaType.ACTIVE and active_id == CRUSTLE:
-                        score = 2100
-                    elif o.inPlayArea == AreaType.BENCH:
-                        bench_i, _ = _best_benched_crustle(your_ps)
-                        if bench_i is not None and o.inPlayIndex == bench_i:
-                            score = 2050
-                        else:
-                            score = -10  # don't waste Cape on a non-Crustle bench slot
-                    else:
-                        score = -10
-                elif target_energy >= MAX_ENERGY:
-                    score = -10
-                else:
-                    # Normal energy/tool: prefer building up the not-yet-ready Crustle.
-                    bench_i, bench_e = _best_benched_crustle(your_ps)
-                    if (
-                        bench_i is not None
-                        and bench_e < CRUSTLE_SWITCH_IN_ENERGY_THRESHOLD
-                        and o.inPlayArea == AreaType.BENCH
-                        and o.inPlayIndex == bench_i
-                    ):
-                        score = 1050
-
-            elif o.type == OptionType.EVOLVE:
-                card = _get_card(obs, o.area, o.index, your_index)
-                score = (
-                    850
-                    if (
-                        card is not None
-                        and card.id == DWEBBLE
-                        and _crustle_line_count(your_ps) < 2
-                    )
-                    else 0
-                )
-
-            elif o.type == OptionType.PLAY:
-                score = 760
-                card = _get_card(obs, AreaType.HAND, o.index, your_index)
-                if card is not None:
-                    cid = card.id
-
-                    if cid == SWITCH and crustle_rdy and active_id != CRUSTLE:
-                        score = 2200
-
-                    elif cid == BOSSS_ORDERS:
-                        score = (
-                            1700 if _opponent_has_bench(current, your_index) else -10
-                        )
-
-                    elif cid == HILDA:
-                        # Prioritise when we need Crustle or Grow Grass Energy.
-                        bench_i, bench_e = _best_benched_crustle(your_ps)
-                        need_crustle = active_id != CRUSTLE and bench_i is None
-                        need_energy = bench_i is not None and not crustle_rdy
-                        score = 1600 if (need_crustle or need_energy) else 700
-
-                    elif cid == JUMBO_ICE_CREAM:
-                        # Heal only when active is actually damaged and has 3+ energies.
-                        mon = active_mon
-                        if (
-                            mon is not None
-                            and mon.hp < mon.maxHp - 30
-                            and len(mon.energies) >= 3
-                        ):
-                            score = 1500
-                        else:
-                            score = 0
-
-                    elif cid == SUPER_POTION:
-                        # Only worth playing when damaged.
-                        mon = active_mon
-                        score = (
-                            1300 if (mon is not None and mon.hp < mon.maxHp - 30) else 0
-                        )
-
-                    elif cid == MORTYS_CONVICTION:
-                        score = 1400
-
-                    elif cid == TEAM_ROCKETS_PETREL:
-                        if not factory:
-                            score = 200
-                        if crustle_rdy and active_id != CRUSTLE:
-                            # Crustle is ready to switch from bench to active, but no switch in hand. Petrel can retrieve switch.
-                            switch_in_hand = any(
-                                c.id == SWITCH
-                                for c in (your_ps.hand or [])
-                                if c is not None
-                            )
-                            score = 2150 if not switch_in_hand else 800
-                    elif cid == TEAM_ROCKETS_FACTORY:
-                        score = 1100 if not factory else -10
-
-                    elif cid == LILLIES_DETERMINATION:
-                        score = 0
-
-            elif o.type == OptionType.ATTACK:
-                # Attack last (ends turn); Crustle attacking is the goal.
-                score = 750
-
-            elif o.type == OptionType.END:
-                score = 700
+        if context == SelectContext.MAIN and board is not None:
+            scores.append(_score_main(o, board))
         else:
-            score = 2000
+            scores.append(_score_sub(o, board, context, sel, obs))
 
-            if o.type == OptionType.CARD:
-                card = _get_card(obs, o.area, o.index, o.playerIndex or your_index)
-
-                # Switch/TO_ACTIVE: prefer a ready benched Crustle.
-                if (
-                    context in (SelectContext.SWITCH, SelectContext.TO_ACTIVE)
-                    and your_ps
-                ):
-                    bench_i, _ = _best_benched_crustle(your_ps)
-                    if (
-                        bench_i is not None
-                        and o.area == AreaType.BENCH
-                        and o.index == bench_i
-                    ):
-                        score += 1000
-
-                # TODO Boss's target, check if can force kill target + win off prizes
-                if context == SelectContext.EFFECT_TARGET and your_index is not None:
-                    if o.playerIndex == 1 - your_index:
-                        score += 500 if o.area == AreaType.ACTIVE else 800
-                        if isinstance(card, Pokemon):
-                            score += len(card.energies) * 50
-
-                # Prefer Crustle line and Grow Grass Energy for evolving, and energies in hand
-                if context in (
-                    SelectContext.EVOLVE,
-                    SelectContext.EVOLVES_FROM,
-                    SelectContext.EVOLVES_TO,
-                    SelectContext.TO_BENCH,
-                    SelectContext.TO_FIELD,
-                    SelectContext.TO_HAND,
-                ):
-                    if card is not None:
-                        if card.id in (DWEBBLE, CRUSTLE, TEAM_ROCKETS_PETREL):
-                            score += 600
-                        elif card.id == HILDA:
-                            score += 500
-                        elif card.id == GROW_GRASS_ENERGY:
-                            score += 400
-
-                if card is not None and isinstance(card, Pokemon):
-                    if your_index is not None and o.playerIndex == 1 - your_index:
-                        score += 500 if o.area == AreaType.ACTIVE else 100
-                        score += len(card.energies) * 50
-                    else:
-                        score += card.hp
-
-            elif o.type == OptionType.YES:
-                score += 100
-
-            elif o.type == OptionType.NUMBER:
-                score += o.number or 0
-
-        scores.append(score)
-
-    sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
+    want = _desired_count(context, options, board, min_count, max_count)
 
     output: list[int] = []
-    for i in range(min(len(sorted_indices), max_count)):
-        idx = sorted_indices[i]
-        if scores[idx] >= 0 or len(output) < min_count:
-            output.append(idx)
+    for i in order:
+        if len(output) >= want and len(output) >= min_count:
+            break
+        # Negative scores are suppressed actions -- take them only when the
+        # engine will not accept a shorter answer.
+        if scores[i] >= 0 or len(output) < min_count:
+            output.append(i)
 
     return output
