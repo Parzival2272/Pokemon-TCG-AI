@@ -49,7 +49,9 @@ TWO NAMED THREATS
     on every Pokemon with an Ability each Checkup. Crustle has an Ability, so
     Froslass chips straight through the ex-damage wall -- the one card that
     beats the gameplan by ignoring it. At 90/60/70 HP it is inside Superb
-    Scissors, so Boss's Orders onto it is the priority use of the card.
+    Scissors, so Boss's Orders onto it is the priority use of the card, and
+    Battle Cage is the backstop: it blanks Freezing Shroud for everything on
+    our Bench (though NOT the Active Spot, so it mitigates rather than solves).
   * Fighting Pokemon: Kangaskhan is {C} with Fighting x2 weakness and gives up
     3 prizes, so a fresh one into a Fighting board is heavily suppressed.
 
@@ -57,7 +59,7 @@ SCORE BANDS (keep new constants inside these)
 ---------------------------------------------
     3000        Run Errand (free draw 2, always first)
     2000-2600   high-priority setup: evolve to Crustle, cape it, Switch to a
-                ready one, Boss with a real target, Bianca saving a wall
+                ready one, Boss with a real target
     1000-1900   ordinary setup: items, supporters, secondary attachments
      600- 999   playable but low value
      300- 500   attacks (they end the turn, so they sit under all setup)
@@ -95,6 +97,7 @@ CRUSTLE = 345
 MEGA_KANGASKHAN_EX = 756
 
 BUDDY_BUDDY_POFFIN = 1086
+HAND_TRIMMER = 1087            # both players discard down to 5, THEM first
 CRUSHING_HAMMER = 1120
 ULTRA_BALL = 1121
 POKEGEAR_3 = 1122
@@ -102,8 +105,6 @@ SWITCH = 1123
 JUMBO_ICE_CREAM = 1147
 HEROS_CAPE = 1159
 BOSSS_ORDERS = 1182
-ERI = 1186
-BIANCAS_DEVOTION = 1190
 XEROSICS_MACHINATIONS = 1197
 TEAM_ROCKETS_PETREL = 1219
 HILDA = 1225
@@ -111,10 +112,23 @@ LILLIES_DETERMINATION = 1227
 COMMUNITY_CENTER = 1242
 FESTIVAL_GROUNDS = 1245
 TEAM_ROCKETS_FACTORY = 1257
+BATTLE_CAGE = 1264             # no damage counters onto BENCHED Pokemon
 
 CRUSTLE_LINE_IDS = (DWEBBLE, CRUSTLE)
+# Only card 104 actually has Freezing Shroud. Both Snorunts can evolve into it
+# -- but they can equally become Mega Froslass ex (861), which has no Ability
+# that touches us, so they are a maybe-threat and scored as one.
+FROSLASS_PRE_EVOLUTION_IDS = (SNORUNT_TWM, SNORUNT_ASC)
 FROSLASS_LINE_IDS = (SNORUNT_TWM, FROSLASS_TWM, SNORUNT_ASC)
-STADIUM_IDS = (TEAM_ROCKETS_FACTORY, COMMUNITY_CENTER, FESTIVAL_GROUNDS)
+STADIUM_IDS = (
+    TEAM_ROCKETS_FACTORY, COMMUNITY_CENTER, FESTIVAL_GROUNDS, BATTLE_CAGE,
+)
+
+# Supporters in the current 60. Used to grade what Pokegear 3.0 digs up.
+DECK_SUPPORTER_IDS = (
+    BOSSS_ORDERS, HILDA, TEAM_ROCKETS_PETREL, LILLIES_DETERMINATION,
+    XEROSICS_MACHINATIONS,
+)
 ENERGY_IDS = (BASIC_GRASS_ENERGY, MIST_ENERGY, SPIKY_ENERGY, GROW_GRASS_ENERGY)
 GRASS_SOURCE_IDS = (BASIC_GRASS_ENERGY, GROW_GRASS_ENERGY)
 
@@ -346,6 +360,19 @@ class _Board:
         self.opp_bench = [m for m in (self.ops.bench or []) if m]
         self.opp_has_fighting = any(_is_fighting(m.id) for m in self.opp_board)
         self.opp_froslass = any(m.id in FROSLASS_LINE_IDS for m in self.opp_board)
+        # Battle Cage stops damage counters being placed on BENCHED Pokemon by
+        # the opponent's attack effects and Abilities. Freezing Shroud is the
+        # named case, but Phantom Dive-style bench sniping is the same shape,
+        # so the trigger is the observable symptom rather than a card list:
+        # our Bench is taking damage at all. Nothing in a normal exchange
+        # damages the Bench, so this is close to a direct read of "an effect
+        # is chipping the pieces I am building".
+        self.bench_taking_damage = any(
+            _damage_on(m) > 0 for m in (self.ps.bench or []) if m is not None
+        )
+        self.wants_battle_cage = (
+            any(m.id == FROSLASS_TWM for m in self.opp_board) or self.bench_taking_damage
+        )
         self.opp_has_energy = any(len(m.energies or []) > 0 for m in self.opp_board)
         self.opp_hand_count = self.ops.handCount or 0
         # Non-ex attackers are the only opposing Pokemon that can damage the
@@ -430,9 +457,17 @@ class _Board:
         if mon is None:
             return 0
         value = 0
-        if mon.id in FROSLASS_LINE_IDS:
-            # The one line that ignores Mysterious Rock Inn. Kill it on sight.
+        if mon.id == FROSLASS_TWM:
+            # The one card that ignores Mysterious Rock Inn. Kill it on sight.
             value += 2000
+        elif mon.id in FROSLASS_PRE_EVOLUTION_IDS:
+            # A Snorunt is only *maybe* the threat: it evolves into either
+            # Froslass (Freezing Shroud) or Mega Froslass ex (no Ability that
+            # touches us). Killing it early is nice, but not worth overriding
+            # the rest of the table on a coin-flip read -- which is what the
+            # old flat +2000 on the whole line did, and the starmie deck
+            # (Snorunt -> Mega Froslass ex) is exactly the case it got wrong.
+            value += 400
         if _crustle_kos(mon):
             value += 600 + 200 * _prize_value(mon.id)
         if not _is_ex(mon.id):
@@ -440,6 +475,20 @@ class _Board:
             value += 300
         value += 25 * len(mon.energies or [])
         return value
+
+
+def _hand_trimmer_gain(b: _Board) -> int:
+    """Net cards Hand Trimmer strips from the opponent, minus what it costs us.
+
+    "Each player discards down to 5, your opponent discards first." Playing it
+    takes it out of our own hand before either player counts, hence the -1 on
+    our side. Symmetric, so it is only worth a card when our hand is already
+    lean and theirs is not -- which is exactly the board this deck grinds
+    toward, since Lillie empties our hand every few turns.
+    """
+    theirs = max(0, b.opp_hand_count - 5)
+    ours = max(0, (len(b.hand_ids) - 1) - 5)
+    return theirs - ours
 
 
 # ── How badly we want each card ───────────────────────────────────────────
@@ -458,8 +507,6 @@ def _want(card_id: int, b: _Board) -> int:
         return 1100 if b.stuck else 250
     if card_id == JUMBO_ICE_CREAM:
         return 900 if b.wants_ice_cream() else 300
-    if card_id == BIANCAS_DEVOTION:
-        return 900 if any(m.hp is not None and m.hp <= 30 for _, _, m in b.line) else 200
     if card_id == HEROS_CAPE:
         return 700 if (b.line_count > 0 and not b.cape_in_play()) else 200
     if card_id == GROW_GRASS_ENERGY:
@@ -491,10 +538,16 @@ def _want(card_id: int, b: _Board) -> int:
         return 350 if b.opp_has_energy else 150
     if card_id == XEROSICS_MACHINATIONS:
         return 500 if b.opp_hand_count >= 6 else 150
-    if card_id == ERI:
-        return 400 if b.opp_hand_count >= 5 else 150
+    if card_id == HAND_TRIMMER:
+        return 450 if _hand_trimmer_gain(b) >= 2 else 150
     if card_id == LILLIES_DETERMINATION:
         return 400 if len(b.hand_ids) <= 3 else 150
+    if card_id == BATTLE_CAGE:
+        # The only card in the 60 that answers Freezing Shroud, so it is worth
+        # digging for specifically rather than as a generic stadium.
+        if b.wants_battle_cage and b.stadium_id != BATTLE_CAGE:
+            return 900
+        return 300 if b.stadium_owner == b.opp else 180
     if card_id in STADIUM_IDS:
         return 300 if b.stadium_owner == b.opp else 180
     if card_id == MEGA_KANGASKHAN_EX:
@@ -613,16 +666,6 @@ def _score_play(o, b: _Board) -> int:
         if damage >= 40:
             return 950
         return -10               # 4 copies; don't burn one to heal 20
-    if cid == BIANCAS_DEVOTION:
-        # Full-heals a Pokemon at <=30 HP remaining -- saves a built wall.
-        savable = [
-            m for m in ([b.active] if b.active else []) + list(b.ps.bench or [])
-            if m is not None and m.hp is not None and m.hp <= 30
-        ]
-        if not savable:
-            return -10
-        return 2350 if any(m.id in CRUSTLE_LINE_IDS for m in savable) else 1300
-
     # ── Targeting ─────────────────────────────────────────────────────────
     if cid == BOSSS_ORDERS:
         if not b.opp_bench:
@@ -659,13 +702,7 @@ def _score_play(o, b: _Board) -> int:
             return 1500
         return -10 if len(b.hand_ids) <= 3 else 400
     if cid == POKEGEAR_3:
-        supporters_in_hand = any(
-            c in (
-                BOSSS_ORDERS, HILDA, TEAM_ROCKETS_PETREL, LILLIES_DETERMINATION,
-                ERI, XEROSICS_MACHINATIONS, BIANCAS_DEVOTION,
-            )
-            for c in b.hand_ids
-        )
+        supporters_in_hand = any(c in DECK_SUPPORTER_IDS for c in b.hand_ids)
         return 800 if supporters_in_hand else 1450
 
     # ── Draw / disruption ─────────────────────────────────────────────────
@@ -686,19 +723,33 @@ def _score_play(o, b: _Board) -> int:
         if b.opp_hand_count >= 5:
             return 1000
         return -10
-    if cid == ERI:
-        if b.opp_hand_count >= 5:
-            return 1350
-        if b.opp_hand_count >= 3:
-            return 800
+    if cid == HAND_TRIMMER:
+        # Symmetric, and it costs a card, so it needs a real edge to be worth
+        # playing. Best right after a Lillie has already emptied our hand.
+        gain = _hand_trimmer_gain(b)
+        if gain >= 4:
+            return 1500
+        if gain >= 2:
+            return 1000
         return -10
     if cid == CRUSHING_HAMMER:
         return 1050 if b.opp_has_energy else -10
 
     # ── Stadiums ──────────────────────────────────────────────────────────
     if cid in STADIUM_IDS:
-        if b.stadium_id == cid and b.stadium_owner == b.me:
-            return -10           # already ours, replacing it does nothing
+        if b.stadium_owner == b.me:
+            # Ours is already down. Replacing it burns a card to swap one
+            # effect for another, so the only case worth it is upgrading into
+            # Battle Cage when something is actually chipping our Bench. The
+            # old check only blocked replacing a stadium with *itself*, which
+            # with four different stadiums in the deck let the agent cycle its
+            # own Community Center out for no gain.
+            upgrading = (
+                cid == BATTLE_CAGE
+                and b.wants_battle_cage
+                and b.stadium_id != BATTLE_CAGE
+            )
+            return 1700 if upgrading else -10
         # Bumping the opponent's stadium is worth more than playing into open
         # space, since theirs is presumably doing something for them.
         score = 1600 if (b.stadium_id is not None and b.stadium_owner == b.opp) else 1000
@@ -715,6 +766,13 @@ def _score_play(o, b: _Board) -> int:
             or b.ps.paralyzed or b.ps.confused
         ):
             score += 400         # status is the other hole in the wall
+        if cid == BATTLE_CAGE and b.wants_battle_cage:
+            # Freezing Shroud is an Ability placing damage counters, so Battle
+            # Cage blanks it for everything on our Bench -- the single best
+            # answer in the 60 to the line that ignores Mysterious Rock Inn.
+            # It does NOT cover the Active Spot, which is why Boss'ing the
+            # Froslass and killing it stays the higher priority.
+            score += 900
         return score
 
     return 700
@@ -904,7 +962,7 @@ def _score_sub(o, b: _Board | None, context, sel: SelectData, obs: Observation) 
     # ── Cards being taken away ────────────────────────────────────────────
     if context in _COST_CONTEXTS:
         if not mine:
-            # Eri and friends: hit their best stuff.
+            # Their cards, being taken away: hit their best stuff.
             return score + 400 + _want(cid, b)
         # Ultra Ball's cost, hand-size trims: invert the want table so the
         # least useful card is the one that goes.
@@ -974,8 +1032,6 @@ def _score_sub(o, b: _Board | None, context, sel: SelectData, obs: Observation) 
             return score + 200 * len(mon.energies or []) + (
                 200 if o.area == AreaType.ACTIVE else 0
             )
-        if effect_id == BIANCAS_DEVOTION and mon is not None and mine:
-            return score + _damage_on(mon) + (400 if mon.id in CRUSTLE_LINE_IDS else 0)
         if effect_id == HEROS_CAPE and mon is not None and mine:
             if mon.id == CRUSTLE:
                 return score + 800
@@ -1017,9 +1073,11 @@ def _desired_count(context, options, b: _Board | None, min_count, max_count) -> 
     take the minimum it will accept -- the notebook's version fills to
     maxCount whenever the scores are positive, which over-discards.
 
-    Eri is the reason this checks ownership rather than just the context:
-    "you discard up to 2 Item cards" arrives as a DISCARD select over the
-    *opponent's* hand, and there we do want the maximum.
+    It checks ownership rather than just the context because an effect that
+    discards from the *opponent's* side arrives as the same DISCARD select,
+    and there we do want the maximum. (The 60 no longer runs Eri, which is
+    what motivated this; Hand Trimmer's own discard is ours, so it correctly
+    takes the minimum.)
     """
     if context in _COST_CONTEXTS and b is not None:
         hits_opponent = any(o.playerIndex == b.opp for o in options)
@@ -1036,14 +1094,14 @@ def agent(obs_dict: dict) -> list[int]:
         2600  Evolve Dwebble -> Crustle
         2500  Boss's Orders onto the Froslass line
         2450  Hero's Cape onto the Crustle line
-        2350  Bianca's Devotion saving a nearly-dead wall
         2300  Switch to a benched Crustle that can attack
         2250  Petrel to fetch that Switch
         2200  Boss's Orders with a convertible target
         2100  Energy onto the build target ({G} source first)
         2050  Buddy-Buddy Poffin / 2000 Hilda / 2000 Lillie on an empty hand
-        1900  Jumbo Ice Cream at (near) full value
+        1900  Battle Cage vs a Froslass board / Jumbo Ice Cream at full value
         1800  Dwebble to the bench / 1600 stadiums / 1500 Kangaskhan
+        1500  Hand Trimmer when it strips 4+ more from them than from us
         1050  Crushing Hammer while they have Energy
          700  anything else playable
          300-500  attacks (they end the turn)

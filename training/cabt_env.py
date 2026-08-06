@@ -87,12 +87,15 @@ class CabtEnv(gym.Env):
                 (e.g. league snapshots saved while training -- see
                 training/league.py); if it returns an empty list the episode
                 falls back to pure self-play.
-                When a pool is given, one opponent is chosen uniformly at
-                random each episode; it controls one side (the learner's side
-                is randomized) and pilots its own `deck`, while the learner
+                When a pool is given, one opponent is chosen at random each
+                episode; it controls one side (the learner's side is
+                randomized) and pilots its own `deck`, while the learner
                 always plays the DECK_PATH deck. `agent_fn` is a
                 callable(obs_dict) -> list[int]; `name` labels the matchup for
-                logging; `deck` is a 60-card ID list.
+                logging; `deck` is a 60-card ID list. An entry may add a 4th
+                element, a relative sampling weight (default 1.0), to be drawn
+                more or less often than the rest -- see
+                _sample_opponent_index.
         """
         super().__init__()
         self.observation_space = gym.spaces.Box(
@@ -119,6 +122,30 @@ class CabtEnv(gym.Env):
         self._max_count = 0
         # Options picked so far in the current decision (reset at each decision).
         self._picked: list[int] = []
+
+    def _sample_opponent_index(self, pool):
+        """Index of this episode's opponent, drawn in proportion to the
+        entries' weights.
+
+        A pool entry may carry an optional 4th element, a relative sampling
+        weight; entries without one weigh 1.0, so an all-3-tuple pool (the
+        common case, and every pool that predates weights) samples uniformly
+        exactly as before. A weight of 2.0 means "faced twice as often as a
+        default opponent", 0.25 means "a quarter as often". Weights are
+        relative, not probabilities -- they are normalized here, so adding or
+        removing an opponent reshuffles everyone's share.
+        """
+        weights = np.array(
+            [float(entry[3]) if len(entry) > 3 else 1.0 for entry in pool],
+            dtype=np.float64,
+        )
+        total = weights.sum()
+        if not np.all(weights >= 0) or total <= 0:
+            # A degenerate pool (all-zero or negative weights) would make
+            # np_random.choice raise mid-episode; uniform is the safe read of
+            # "no usable preference expressed".
+            return int(self.np_random.integers(0, len(pool)))
+        return int(self.np_random.choice(len(pool), p=weights / total))
 
     def _play_opponent_until_learner_turn(self, obs_dict):
         """Auto-play the non-learner side with `opponent_agent` until it's
@@ -204,8 +231,8 @@ class CabtEnv(gym.Env):
         if pool:
             # Pick a fresh opponent for this episode; it pilots its own deck.
             self._opponent_name, self._opponent_agent, opp_deck = pool[
-                int(self.np_random.integers(0, len(pool)))
-            ]
+                self._sample_opponent_index(pool)
+            ][:3]
             # Randomize which side the learner plays so it doesn't overfit
             # to always going first (or second).
             self._learner_index = int(self.np_random.integers(0, 2))

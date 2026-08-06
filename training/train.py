@@ -55,6 +55,13 @@ def _load_deck(path):
 # Each entry is (name, agent_fn, deck) and the opponent pilots its OWN deck --
 # a heuristic piloting a foreign deck wouldn't exercise the strategy it was
 # written for. The learner always plays the CabtEnv DECK_PATH deck.
+#
+# An entry may add a 4th element, a relative sampling weight (default 1.0), to
+# skew how often that matchup comes up: lucario is at 2.0 and iono at 0.25
+# below, i.e. lucario is faced twice as often as a default opponent and iono a
+# quarter as often. Weights are relative and normalized over the whole pool,
+# so with these two set the eleven entries no longer split episodes evenly --
+# read win_rate/<name> per opponent rather than assuming equal sample counts.
 OPPONENT_POOL = [
     ("crustle", crustle_agent, _load_deck("heuristics/crustle_agent/deck.csv")),
     ("abomasnow", abomasnow_agent, _load_deck("heuristics/abomasnow_agent/deck.csv")),
@@ -64,7 +71,7 @@ OPPONENT_POOL = [
         dragapult_v2_agent,
         _load_deck("heuristics/dragapult_v2_agent/deck.csv"),
     ),
-    ("iono", iono_agent, _load_deck("heuristics/iono_agent/deck.csv")),
+    ("iono", iono_agent, _load_deck("heuristics/iono_agent/deck.csv"), 0.25),
     (
         "archaludon",
         archaludon_agent,
@@ -88,7 +95,7 @@ OPPONENT_POOL = [
     # lucario/ is the one heuristic laid out as a standalone Kaggle
     # submission rather than an agent package -- see its __init__.py for the
     # `cg` -> ptcg aliasing that makes it importable here.
-    ("lucario", lucario_agent, _load_deck("heuristics/lucario/deck.csv")),
+    ("lucario", lucario_agent, _load_deck("heuristics/lucario/deck.csv"), 2.0),
 ]
 
 # Which device MaskablePPO trains the policy/value networks on. Defaults to
