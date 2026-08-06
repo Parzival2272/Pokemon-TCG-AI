@@ -387,8 +387,19 @@ def _has_special_condition(mon, keyword=None):
     return False
 
 
+def _energy_id(energy):
+    """Card id of one attached-Energy entry. The obs may serialize an attached
+    Energy either as a card dict or as a bare card id, so accept both and fail
+    safe to None for anything else."""
+    if isinstance(energy, dict):
+        return energy.get("id")
+    if isinstance(energy, int) and not isinstance(energy, bool):
+        return energy
+    return getattr(energy, "id", None)
+
+
 def _has_mist(mon):
-    return any((e or {}).get("id") == MIST_ENERGY for e in _energies(mon))
+    return any(_energy_id(e) == MIST_ENERGY for e in _energies(mon))
 
 
 def _retreat_cost(mon):
