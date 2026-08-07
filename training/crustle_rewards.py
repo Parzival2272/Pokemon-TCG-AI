@@ -488,8 +488,22 @@ def _has_special_condition(mon, keyword=None):
     return False
 
 
+def _energy_id(energy):
+    """Card id of one attached-Energy entry. The obs serializes an attached
+    Energy either as a card dict or as a bare card id -- both occur in the same
+    run -- so accept either and fail safe to None for anything else. Every read
+    of an attached Energy's id must go through this; `(e or {}).get("id")`
+    crashes the worker on the bare-int form (AttributeError in _board_snapshot,
+    which kills the SubprocVecEnv pipe)."""
+    if isinstance(energy, dict):
+        return energy.get("id")
+    if isinstance(energy, int) and not isinstance(energy, bool):
+        return energy
+    return getattr(energy, "id", None)
+
+
 def _has_mist(mon):
-    return any((e or {}).get("id") == MIST_ENERGY for e in _energies(mon))
+    return any(_energy_id(e) == MIST_ENERGY for e in _energies(mon))
 
 
 def _retreat_cost(mon):
@@ -525,7 +539,7 @@ def _board_snapshot(obs_dict, player_index):
             out[_slot_key(m, area, i)] = (
                 m.get("id"),
                 area,
-                Counter((e or {}).get("id") for e in _energies(m)),
+                Counter(_energy_id(e) for e in _energies(m)),
                 m.get("maxHp"),
             )
     return out
@@ -867,7 +881,7 @@ def _mist_secured(obs_dict, player_index):
     for."""
     count = sum(1 for cid in _hand_ids(obs_dict, player_index) if cid == MIST_ENERGY)
     for m in _pokemon_in_play(obs_dict, player_index):
-        count += sum(1 for e in _energies(m) if (e or {}).get("id") == MIST_ENERGY)
+        count += sum(1 for e in _energies(m) if _energy_id(e) == MIST_ENERGY)
     return count
 
 
@@ -1154,7 +1168,7 @@ def _energy_terms(prev_obs, cur_obs, me_index, opp_index, matchup):
         default=0,
     )
     mist_already = sum(
-        sum(1 for e in _energies(m) if (e or {}).get("id") == MIST_ENERGY)
+        sum(1 for e in _energies(m) if _energy_id(e) == MIST_ENERGY)
         for m in _pokemon_in_play(prev_obs, me_index)
         if m.get("id") == MEGA_KANGASKHAN_EX
     )
