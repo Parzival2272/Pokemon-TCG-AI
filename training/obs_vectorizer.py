@@ -41,7 +41,12 @@ OPT_CARD_FEATURES = 14
 # energy count. Two "attach Water" options onto different Pokemon are scored
 # very differently by the expert but were otherwise identical in the vector.
 OPT_TARGET_FEATURES = 5
-OPTION_FEATURES = OPT_BASE_FEATURES + OPT_CARD_FEATURES + OPT_TARGET_FEATURES
+# Determinized next-state summary of the option when it can be simulated as a
+# finalized selection: the same scalar block as the current state, but for the
+# search-projected observation after picking that option (or the current state
+# again when the choice cannot legally finalize yet).
+NEXT_STATE_FEATURES = 18
+OPTION_FEATURES = OPT_BASE_FEATURES + OPT_CARD_FEATURES + OPT_TARGET_FEATURES + NEXT_STATE_FEATURES
 
 # Semantic attributes (OPT_CARD_FEATURES each) of the OPPONENT's Pokemon --
 # active + bench. The heuristics read opponent card attributes (Water weakness,
@@ -101,12 +106,16 @@ def set_vectorizer_deck(deck: list[int]) -> None:
 # directly. Precomputed once per card id -- vectorization is the training
 # step's hot path, so a live DB lookup per option would be too costly.
 try:
-    from ptcg.api import all_card_data, CardType
+    from ptcg.api import all_card_data, CardType, search_begin, search_end, search_step, to_observation_class
 
     _CARD_DB = {c.cardId: c for c in all_card_data()}
 except Exception:  # DLL / card data unavailable -> features degrade to zeros
     CardType = None
     _CARD_DB = {}
+    search_begin = None
+    search_end = None
+    search_step = None
+    to_observation_class = None
 
 _WATER = 3  # EnergyType.WATER
 
@@ -142,6 +151,19 @@ def _card_semantic_feats(data) -> list[float]:
 # id -> precomputed semantic feature list; unknown ids fall back to zeros.
 _CARD_FEATS = {cid: _card_semantic_feats(d) for cid, d in _CARD_DB.items()}
 _ZERO_CARD_FEATS = [0.0] * OPT_CARD_FEATURES
+
+_BASIC_POKEMON_IDS = sorted(
+    cid
+    for cid, data in _CARD_DB.items()
+    if getattr(data, "cardType", None) == CardType.POKEMON and getattr(data, "basic", False)
+) if CardType is not None else []
+_ENERGY_CARD_IDS = sorted(
+    cid
+    for cid, data in _CARD_DB.items()
+    if getattr(data, "cardType", None) in (getattr(CardType, "BASIC_ENERGY", None), getattr(CardType, "SPECIAL_ENERGY", None))
+) if CardType is not None else []
+_DEFAULT_BASIC_POKEMON_ID = _BASIC_POKEMON_IDS[0] if _BASIC_POKEMON_IDS else (next(iter(_CARD_DB)) if _CARD_DB else 0)
+_DEFAULT_ENERGY_ID = _ENERGY_CARD_IDS[0] if _ENERGY_CARD_IDS else _DEFAULT_BASIC_POKEMON_ID
 
 # Indices into a card's semantic feature list (see _card_semantic_feats order).
 _F_STAGE1, _F_STAGE2, _F_EX, _F_MEGA, _F_WATER_WEAK = 7, 8, 9, 10, 11
@@ -416,6 +438,202 @@ def _option_target_feats(obs_dict, current, opt, your_index) -> list[float]:
     ]
 
 
+def _visible_opponent_card_ids(current: dict, opp_index: int) -> list[int]:
+    """Cards on the opponent's visible side, excluding hand.
+
+    This is only used to seed a determinized search; it does not need to be
+    exact, just plausible and deterministic.
+    """
+    players = current.get("players") or [{}, {}]
+    opp = players[opp_index] if len(players) > opp_index else {}
+    card_ids: list[int] = []
+
+    for c in (opp.get("discard") or []):
+        cid = c.get("id") if c else None
+        if cid:
+            card_ids.append(cid)
+
+    for mon in (opp.get("active") or []):
+        if not mon:
+            continue
+        mid = mon.get("id")
+        if mid:
+            card_ids.append(mid)
+        for ec in (mon.get("energyCards") or []):
+            cid = ec.get("id") if ec else None
+            if cid:
+                card_ids.append(cid)
+        for tc in (mon.get("tools") or []):
+            cid = tc.get("id") if tc else None
+            if cid:
+                card_ids.append(cid)
+        for pe in (mon.get("preEvolution") or []):
+            cid = pe.get("id") if pe else None
+            if cid:
+                card_ids.append(cid)
+
+    for mon in (opp.get("bench") or []):
+        if not mon:
+            continue
+        mid = mon.get("id")
+        if mid:
+            card_ids.append(mid)
+        for ec in (mon.get("energyCards") or []):
+            cid = ec.get("id") if ec else None
+            if cid:
+                card_ids.append(cid)
+        for tc in (mon.get("tools") or []):
+            cid = tc.get("id") if tc else None
+            if cid:
+                card_ids.append(cid)
+        for pe in (mon.get("preEvolution") or []):
+            cid = pe.get("id") if pe else None
+            if cid:
+                card_ids.append(cid)
+
+    for c in (current.get("stadium") or []):
+        if not c or c.get("playerIndex") != opp_index:
+            continue
+        cid = c.get("id")
+        if cid:
+            card_ids.append(cid)
+
+    for c in (current.get("looking") or []):
+        if not c or c.get("playerIndex") != opp_index:
+            continue
+        cid = c.get("id")
+        if cid:
+            card_ids.append(cid)
+
+    for c in (opp.get("prize") or []):
+        if c is None:
+            continue
+        cid = c.get("id")
+        if cid:
+            card_ids.append(cid)
+
+    return card_ids
+
+
+def _determinized_search_inputs(obs_dict: dict) -> dict | None:
+    """Build plausible hidden-zone inputs for ptcg.api.search_begin.
+
+    The returned lists only need to be long enough to satisfy search_begin's
+    length checks. They are deterministic approximations so we can project the
+    next state without modifying the live battle.
+    """
+    if to_observation_class is None:
+        return None
+
+    current = obs_dict.get("current") or {}
+    players = current.get("players") or [{}, {}]
+    your_index = int(current.get("yourIndex", 0) or 0)
+    opp_index = 1 - your_index
+    you = players[your_index] if len(players) > your_index else {}
+    opp = players[opp_index] if len(players) > opp_index else {}
+
+    if not VECTORIZER_DECK:
+        return None
+
+    visible_you = Counter(visible_owned_card_ids(current, your_index))
+    deck_total = Counter(VECTORIZER_DECK)
+    your_pool: list[int] = []
+    for cid in VECTORIZER_DECK:
+        if deck_total[cid] > visible_you.get(cid, 0):
+            your_pool.append(cid)
+            deck_total[cid] -= 1
+
+    your_deck_count = int(you.get("deckCount") or 0)
+    your_prize_hidden = sum(1 for c in (you.get("prize") or []) if c is None)
+    if len(your_pool) < your_deck_count + your_prize_hidden:
+        your_pool += [_DEFAULT_BASIC_POKEMON_ID] * (your_deck_count + your_prize_hidden - len(your_pool))
+    your_deck = your_pool[:your_deck_count]
+    your_prize = your_pool[your_deck_count:your_deck_count + your_prize_hidden]
+
+    op_visible = Counter(_visible_opponent_card_ids(current, opp_index))
+    opp_top_card = max(op_visible.items(), key=lambda item: item[1])[0] if op_visible else _DEFAULT_BASIC_POKEMON_ID
+    etype = [0] * N_ENERGY_TYPES
+    for mon in (opp.get("active") or []) + list(opp.get("bench") or []):
+        if not mon:
+            continue
+        for e in (mon.get("energies") or []):
+            if isinstance(e, int) and 0 <= e < N_ENERGY_TYPES:
+                etype[e] += 1
+    opp_energy_card = _DEFAULT_ENERGY_ID
+    if any(etype):
+        opp_energy_card = _DEFAULT_ENERGY_ID
+
+    opp_deck_count = int(opp.get("deckCount") or 0)
+    opp_prize_hidden = sum(1 for c in (opp.get("prize") or []) if c is None)
+    opp_hand_count = int(opp.get("handCount") or 0)
+    opp_pool = [opp_top_card] * 30 + [opp_energy_card] * 30 + [_DEFAULT_BASIC_POKEMON_ID] * 8
+    need = opp_deck_count + opp_prize_hidden + opp_hand_count
+    if len(opp_pool) < need:
+        opp_pool += [opp_energy_card] * (need - len(opp_pool))
+    opponent_deck = opp_pool[:opp_deck_count]
+    opponent_prize = opp_pool[opp_deck_count:opp_deck_count + opp_prize_hidden]
+    opponent_hand = opp_pool[opp_deck_count + opp_prize_hidden:opp_deck_count + opp_prize_hidden + opp_hand_count]
+
+    opponent_active = []
+    active = opp.get("active") or []
+    if len(active) > 0 and active[0] is None:
+        opponent_active = [opp_top_card if opp_top_card else _DEFAULT_BASIC_POKEMON_ID]
+
+    return {
+        "obs": to_observation_class(obs_dict),
+        "your_deck": your_deck,
+        "your_prize": your_prize,
+        "opponent_deck": opponent_deck,
+        "opponent_prize": opponent_prize,
+        "opponent_hand": opponent_hand,
+        "opponent_active": opponent_active,
+    }
+
+
+def _state_block_from_obs(obs_dict: dict) -> list[float]:
+    current = obs_dict.get("current") or {}
+    players = current.get("players") or [{}, {}]
+    your_index = int(current.get("yourIndex", 0) or 0)
+    you = players[your_index] if len(players) > your_index else {}
+    opp = players[1 - your_index] if len(players) > 1 else {}
+    select = obs_dict.get("select") or {}
+    picked_count = 0
+    n_opt = min(len(select.get("option") or []), MAX_OPTIONS)
+    min_count_eff = min(int(select.get("minCount") or 0), n_opt)
+    can_stop = 1.0 if picked_count >= min_count_eff else 0.0
+    return _state_block(current, select, you, opp, your_index, picked_count, can_stop)
+
+
+def _next_state_block_for_option(
+    obs_dict: dict,
+    picked_set: set[int],
+    option_index: int,
+    search_root_id: int | None,
+) -> list[float]:
+    """Determinize one option into a projected next-state summary.
+
+    If the hypothetical selection cannot yet finalize, the engine state does
+    not advance, so the current state block is returned instead.
+    """
+    current_block = _state_block_from_obs(obs_dict)
+    if search_root_id is None:
+        return current_block
+
+    select = obs_dict.get("select") or {}
+    options = select.get("option") or []
+    n_opt = min(len(options), MAX_OPTIONS)
+    min_count_eff = min(int(select.get("minCount") or 0), n_opt)
+    candidate = sorted(set(picked_set) | {option_index})
+    if len(candidate) < min_count_eff:
+        return current_block
+
+    try:
+        next_state = search_step(search_root_id, candidate).observation
+        return _state_block_from_obs(next_state)
+    except Exception:
+        return current_block
+
+
 def _poke_vec(mon) -> list[float]:
     if not mon:
         return [0.0] * POKE_FEATURES
@@ -576,19 +794,49 @@ def obs_to_vector(obs_dict: dict, picked=()) -> np.ndarray:
     # Select context (what kind of decision is this?)
     context = (select.get("context") or 0) / 50
 
+    search_root_id = None
+    search_ctx = None
+    if obs_dict.get("search_begin_input") is not None:
+        try:
+            search_ctx = _determinized_search_inputs(obs_dict)
+            if search_ctx is not None:
+                root = search_begin(
+                    search_ctx["obs"],
+                    search_ctx["your_deck"],
+                    search_ctx["your_prize"],
+                    search_ctx["opponent_deck"],
+                    search_ctx["opponent_prize"],
+                    search_ctx["opponent_hand"],
+                    search_ctx["opponent_active"],
+                    False,
+                )
+                search_root_id = root.searchId
+        except Exception:
+            search_root_id = None
+            search_ctx = None
+
     # Per-option block: base features (type, acted-on card id, attack id,
     # picked flag), then the acted-on card's semantic attributes, then the
-    # in-play Pokemon the option targets.
+    # in-play Pokemon the option targets, then the determinized next-state
+    # summary for that option.
     options = select.get("option") or []
     opt_block: list[float] = []
-    for idx, o in enumerate(options[:MAX_OPTIONS]):
-        cid = _option_card_id(obs_dict, current, o, your_index)
-        opt_block.append((o.get("type") or 0) / 16)
-        opt_block.append(cid / CARD_ID_NORM)
-        opt_block.append((o.get("attackId") or 0) / CARD_ID_NORM)
-        opt_block.append(1.0 if idx in picked_set else 0.0)
-        opt_block.extend(_CARD_FEATS.get(cid, _ZERO_CARD_FEATS))
-        opt_block.extend(_option_target_feats(obs_dict, current, o, your_index))
+    try:
+        for idx, o in enumerate(options[:MAX_OPTIONS]):
+            cid = _option_card_id(obs_dict, current, o, your_index)
+            opt_block.append((o.get("type") or 0) / 16)
+            opt_block.append(cid / CARD_ID_NORM)
+            opt_block.append((o.get("attackId") or 0) / CARD_ID_NORM)
+            opt_block.append(1.0 if idx in picked_set else 0.0)
+            opt_block.extend(_CARD_FEATS.get(cid, _ZERO_CARD_FEATS))
+            opt_block.extend(_option_target_feats(obs_dict, current, o, your_index))
+            opt_block.extend(_next_state_block_for_option(obs_dict, picked_set, idx, search_root_id))
+    finally:
+        if search_root_id is not None:
+            try:
+                search_end()
+            except Exception:
+                pass
     opt_block += [0.0] * (OPTION_FEATURES * MAX_OPTIONS - len(opt_block))
 
     # Opponent Pokemon semantics (active + bench) and the derived matchup
