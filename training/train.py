@@ -1,3 +1,4 @@
+import importlib
 import os
 import time
 from datetime import timedelta
@@ -8,7 +9,12 @@ from sb3_contrib.common.wrappers import ActionMasker
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
-from training.cabt_env import DECK_PATH, POLICY_NET_ARCH, CabtEnv
+from training.cabt_env import (
+    DECK_PATH,
+    DEFAULT_REWARD_MODULE,
+    POLICY_NET_ARCH,
+    CabtEnv,
+)
 from training.callbacks import RewardTermCallback, SnapshotCallback, WinRateCallback
 from training.league import SnapshotOpponentPool
 
@@ -43,6 +49,39 @@ _alakazam_v2_module.USE_SEARCH = os.environ.get("ALAKAZAM_V2_SEARCH") == "1"
 # cannot corrupt the worker's live battle -- it is purely a speed tradeoff.
 
 
+# ── Which deck this run trains, and the shaping it is graded by ─────────────
+# These MUST agree, and warm-starting cannot check it for you: BC_INIT is a
+# strict load_state_dict, but "strict" only compares tensor shapes, and every
+# deck produces the same OBS_SIZE-wide observation and the same net_arch. So
+# BC_INIT=ppo_iono_bc.zip against the crustle deck loads without complaint and
+# then trains for hours on a policy imitating lines this deck cannot play --
+# silently, and worse than having started random. The startup banner below
+# prints all three so a mismatch is visible in the first second of the run
+# rather than inferred from a bad win rate hours later.
+#
+# Both default to cabt_env's crustle pairing, so an unset environment behaves
+# exactly as this file always has. To train a different deck, override BOTH:
+#
+#   DECK_PATH=heuristics/iono_agent/deck.csv \
+#   REWARD_MODULE=training.outcome_rewards \
+#   MODEL_NAME=ppo_iono_v1 \
+#   BC_INIT=ppo_iono_bc.zip python -m training.train
+#
+# Read at module level rather than inside main: SubprocVecEnv workers re-import
+# this module when they spawn, and they inherit the environment, so this is
+# what carries the choice into them.
+LEARNER_DECK_PATH = os.environ.get("DECK_PATH", DECK_PATH)
+# Name of the saved model. Overridable so a run on a different deck doesn't
+# overwrite the crustle model -- the previous hardcoded default is kept.
+MODEL_NAME = os.environ.get("MODEL_NAME", "ppo_crustle_v3")
+_reward_module_name = os.environ.get("REWARD_MODULE")
+REWARD_MODULE = (
+    importlib.import_module(_reward_module_name)
+    if _reward_module_name
+    else DEFAULT_REWARD_MODULE
+)
+
+
 def _load_deck(path):
     with open(path) as f:
         deck = [int(x) for x in f.read().splitlines() if x.strip()]
@@ -54,7 +93,7 @@ def _load_deck(path):
 # Heuristic opponent pool: one is drawn at random each episode (see CabtEnv).
 # Each entry is (name, agent_fn, deck) and the opponent pilots its OWN deck --
 # a heuristic piloting a foreign deck wouldn't exercise the strategy it was
-# written for. The learner always plays the CabtEnv DECK_PATH deck.
+# written for. The learner always plays the LEARNER_DECK_PATH deck.
 #
 # An entry may add a 4th element, a relative sampling weight (default 1.0), to
 # skew how often that matchup comes up: lucario is at 2.0 and iono at 0.25
@@ -229,8 +268,10 @@ def make_league_env():
     # the heuristics rather than to pure self-play -- see SnapshotOpponentPool.
     env = CabtEnv(
         opponent_agents=SnapshotOpponentPool(
-            SNAPSHOT_DIR, _load_deck(DECK_PATH), fallback=OPPONENT_POOL
-        )
+            SNAPSHOT_DIR, _load_deck(LEARNER_DECK_PATH), fallback=OPPONENT_POOL
+        ),
+        deck_path=LEARNER_DECK_PATH,
+        reward_module=REWARD_MODULE,
     )
     env = ActionMasker(env, mask_fn)
     # info_keywords lifts CabtEnv's per-episode "opponent" tag into
@@ -240,7 +281,11 @@ def make_league_env():
 
 
 def make_heuristic_env():
-    env = CabtEnv(opponent_agents=OPPONENT_POOL)
+    env = CabtEnv(
+        opponent_agents=OPPONENT_POOL,
+        deck_path=LEARNER_DECK_PATH,
+        reward_module=REWARD_MODULE,
+    )
     env = ActionMasker(env, mask_fn)
     env = Monitor(env, info_keywords=("opponent",))
     return env
@@ -262,6 +307,12 @@ if __name__ == "__main__":
     env = SubprocVecEnv(env_fns)
 
     print(f"Training on device: {DEVICE}")
+    # The deck/shaping/warm-start triple, printed together because nothing
+    # downstream can verify they agree -- see the LEARNER_DECK_PATH comment.
+    print(f"Learner deck      : {LEARNER_DECK_PATH}")
+    print(f"Reward module     : {REWARD_MODULE.__name__}")
+    print(f"Warm start        : {os.environ.get('BC_INIT') or '(none, random init)'}")
+    print(f"Saves to          : {MODEL_NAME}.zip")
     print(
         f"LR schedule: {LR_START:.1e} -> {LR_END:.1e} over the first "
         f"{LR_DECAY_FRAC:.0%} of training, then flat"
@@ -315,8 +366,7 @@ if __name__ == "__main__":
     )
     elapsed = time.perf_counter() - start
 
-    model_name = "ppo_crustle_v3"
-    model.save(model_name)
+    model.save(MODEL_NAME)
 
     # ---- End-of-training report -------------------------------------------
     steps_done = model.num_timesteps
@@ -357,4 +407,9 @@ if __name__ == "__main__":
         if g:
             print(f"  {name:<22}: {w / g:6.1%}  ({w:,}/{g:,})")
     print("=" * 60)
-    print(f"Saved model to {model_name}.zip")
+    print(f"Saved model to {MODEL_NAME}.zip")
+
+
+#   $env:DECK_PATH='heuristics/iono_agent/deck.csv'; $env:REWARD_MODULE='training.outcome_rewards'
+#   $env:MODEL_NAME='ppo_iono_v1'; $env:BC_INIT='ppo_iono_bc.zip'
+#   python -m training.train
