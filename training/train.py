@@ -304,7 +304,7 @@ if __name__ == "__main__":
         model.policy.load_state_dict(params["policy"])
         print(f"Warm-started policy from {bc_init}")
 
-    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 15_000_000))
+    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 25_000_000))
     win_rate_cb = WinRateCallback()  # snapshot_cb was built above, before the envs
     reward_term_cb = RewardTermCallback()
 
@@ -315,7 +315,7 @@ if __name__ == "__main__":
     )
     elapsed = time.perf_counter() - start
 
-    model_name = "ppo_crustle_v2"
+    model_name = "ppo_crustle_v3"
     model.save(model_name)
 
     # ---- End-of-training report -------------------------------------------

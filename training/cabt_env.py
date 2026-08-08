@@ -8,14 +8,19 @@ from training.obs_vectorizer import (
     obs_to_vector,
     set_vectorizer_deck,
 )
-from training.crustle_rewards import reset_turn_tracking, reward_terms
+from training import crustle_rewards as _crustle_rewards
 import numpy as np
 import gymnasium as gym
 
-# The learner's deck. Paired with the reward module imported above: the shaping
-# in crustle_rewards.py keys on this list's card IDs (Dwebble/Crustle, Mega
-# Kangaskhan ex, Hero's Cape), so the two must be swapped together.
+# The learner's deck, and the reward module it is paired with -- the shaping in
+# crustle_rewards.py keys on this list's card IDs (Dwebble/Crustle, Mega
+# Kangaskhan ex, Hero's Cape), so the two must ALWAYS be swapped together.
+# These are the defaults for both of CabtEnv's `deck_path` / `reward_module`
+# arguments, which exist so a caller can pilot a different deck without
+# editing this file (see the per-expert BC passes, training/bc_iono.py and
+# friends, which pair their expert's own deck with training/outcome_rewards).
 DECK_PATH = "crustle_deck.csv"
+DEFAULT_REWARD_MODULE = _crustle_rewards
 
 # Shared policy/value network architecture. bc.py builds a MaskablePPO with
 # this net_arch, and train.py warm-starts (load_state_dict, which is strict)
@@ -27,9 +32,10 @@ DECK_PATH = "crustle_deck.csv"
 POLICY_NET_ARCH = [256, 256]
 
 
-def _load_deck():
-    """Load a 60-card deck (one card ID per line) from DECK_PATH."""
-    with open(DECK_PATH, "r") as f:
+def _load_deck(path=None):
+    """Load a 60-card deck (one card ID per line) from `path` (default
+    DECK_PATH)."""
+    with open(path or DECK_PATH, "r") as f:
         deck = [int(x) for x in f.read().splitlines() if x.strip()]
     if len(deck) != 60:
         raise ValueError(
@@ -76,9 +82,25 @@ class CabtEnv(gym.Env):
     # 0..MAX_OPTIONS-1 pick the corresponding option.
     STOP_ACTION = MAX_OPTIONS
 
-    def __init__(self, opponent_agents=None):
+    def __init__(self, opponent_agents=None, deck_path=None, reward_module=None):
         """
         Args:
+            deck_path: Deck the LEARNER seat pilots, defaulting to the
+                module-level DECK_PATH (the crustle list train.py trains on).
+                Overridden by the per-expert behavior-cloning passes
+                (training/bc_iono.py and friends), which need the learner seat
+                piloting the deck their expert was written for -- a heuristic
+                driving a foreign list demonstrates lines its deck cannot
+                support. Only the learner's deck; opponents always pilot the
+                deck carried in their own pool entry.
+            reward_module: Object exposing `reset_turn_tracking()` and
+                `reward_terms(prev_obs, cur_obs, done, result, me_index)`,
+                defaulting to training.crustle_rewards. Must be swapped
+                together with `deck_path`: crustle_rewards keys most of its
+                shaping on the crustle list's card IDs, so on a foreign deck
+                its board-shape / Kangaskhan / retreat penalties fire on
+                boards they were never written for. The BC passes pass
+                training.outcome_rewards (deck-agnostic) instead.
             opponent_agents: Optional pool of opponents. Either None
                 (pure self-play -- both sides are the RL policy, both playing
                 the DECK_PATH deck), a list of (name, agent_fn, deck) tuples,
@@ -111,6 +133,8 @@ class CabtEnv(gym.Env):
         # masked categorical instead of MAX_OPTIONS independent Bernoullis.
         self.action_space = gym.spaces.Discrete(self.MAX_OPTIONS + 1)
 
+        self._deck_path = deck_path or DECK_PATH
+        self._rewards = reward_module or DEFAULT_REWARD_MODULE
         self._opponent_agents = opponent_agents
         # Per-episode opponent, chosen in reset() (None while in self-play).
         self._opponent_agent = None
@@ -206,7 +230,7 @@ class CabtEnv(gym.Env):
         if Battle.battle_ptr:
             battle_finish()
             Battle.battle_ptr = None
-        learner_deck = _load_deck()
+        learner_deck = _load_deck(self._deck_path)
         # Prize-belief features are always from the learner's perspective, so
         # the vectorizer deck is the learner's deck regardless of opponent.
         set_vectorizer_deck(learner_deck)
@@ -219,7 +243,7 @@ class CabtEnv(gym.Env):
         # out once per process instead of once per game -- ~0.0 per episode in
         # the logs. One battle per process (Battle.battle_ptr is global), so
         # module-level state is safe here; key it by env id if that changes.
-        reset_turn_tracking()
+        self._rewards.reset_turn_tracking()
 
         # A callable pool is re-evaluated every episode so it can grow/shrink
         # mid-run (league snapshots); a plain list is used as-is.
@@ -327,7 +351,7 @@ class CabtEnv(gym.Env):
         # reward_terms() is called exactly once per step (it advances turn
         # state as a side effect) and summed here, so the scalar reward and
         # the logged breakdown are guaranteed to be the same number.
-        terms = reward_terms(prev_obs, obs_dict, done, result, me_index)
+        terms = self._rewards.reward_terms(prev_obs, obs_dict, done, result, me_index)
         reward = sum(terms.values())
 
         # Per-step reward breakdown for RewardTermCallback. ~19 floats
