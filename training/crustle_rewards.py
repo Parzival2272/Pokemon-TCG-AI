@@ -34,13 +34,23 @@ sign in that matchup and the Mist bonus is multiplied.
 Two more matchups get named Boss's Orders targets:
   * Iono's Bellibolt ex: drag up Iono's Voltorb (the setup Basic) when Crustle
     can finish it, Iono's Kilowattrel second.
-  * Mega Lucario ex: Makuhita first, Hariyama second -- Fighting is
-    Kangaskhan's x2 weakness, so cutting the line off early matters most.
-And one named threat, Froslass TWM 53: Freezing Shroud drops a counter on
-every Pokemon with an Ability each Checkup, which chips our Crustles straight
-through Rock Inn. Battle Cage (new in this list) blanks it -- it stops damage
-counters being placed on Benched Pokemon by effects and Abilities -- so the
-stadium term pays extra for dropping it in that matchup.
+  * Mega Lucario ex: a CHARGED Hariyama first -- it is the piece that can
+    already swing into Kangaskhan's x2 Fighting weakness right now -- then
+    Makuhita (cuts the evolution line off before it becomes that threat), then
+    a bare Hariyama last.
+And several named priorities that apply regardless of matchup: Froslass TWM
+53, the Crustle mirror, and (Abomasnow matchup) their benched Kyogre. Froslass's
+Freezing Shroud drops a counter on every Pokemon with an Ability each Checkup,
+which chips our Crustles straight through Rock Inn -- Battle Cage (new in this
+list) blanks it, so the stadium term pays extra for dropping it in that
+matchup, and Boss's Orders ALWAYS prioritizes dragging a Froslass up over
+anything else on their bench, named or not (it shows up as a small tech in
+other lists too, Grimmsnarl included, not just its own line). In the mirror,
+the Boss priority is an opposing Crustle that hasn't reached attack cost yet
+-- it can't hit back, so it eats free damage every turn it's forced to stay
+Active. Against Abomasnow, Boss always goes after the benched Kyogre with the
+most Energy on it -- see BOSS_ABOMASNOW_KYOGRE_REWARD for the caveat that this
+one is running on unverified card IDs.
 
 VERIFIED VS INFERRED
 --------------------
@@ -163,6 +173,11 @@ HERO_CAPE_WASTED_PENALTY = 0.040
 # Petrel tutors any Trainer, and with a single Cape in the list, fetching it
 # is one of the highest-value things Petrel does.
 PETREL_FETCHES_CAPE_REWARD = 0.060
+# When the board has no Crustle-line member AND the hand has no Dwebble,
+# Poffin or Ultra Ball either, Petrel (fetching a Poffin) is the ONLY card
+# left that can put a body on the board at all -- every other Supporter is
+# strictly worse in that exact spot. Stacks on top of the normal tutor payout.
+PETREL_LAST_RESORT_REWARD = 0.050
 
 # ── Healing ───────────────────────────────────────────────────────────────
 # Jumbo Ice Cream heals 80 off an Active with 3+ energy. Fixed charge plus a
@@ -192,7 +207,11 @@ TRIMMER_MAX_REWARD = 0.060
 TRIMMER_SELF_DISCARD_PENALTY = 0.010
 
 # ── Boss's Orders targeting ───────────────────────────────────────────────
-BOSS_FROSLASS_REWARD = 0.080        # Freezing Shroud chips through Rock Inn
+# Bumped above every other named target (even a charged Hariyama plus its KO
+# bonus, 0.160) on purpose: Froslass shows up as a small tech in more decks
+# than just its own line (Grimmsnarl included), and whenever it's on their
+# bench it should always win the Boss pick, matchup or not.
+BOSS_FROSLASS_REWARD = 0.170        # Freezing Shroud chips through Rock Inn
 BOSS_VOLTORB_REWARD = 0.100         # Bellibolt matchup, primary
 BOSS_KILOWATTREL_REWARD = 0.070     # Bellibolt matchup, secondary
 # Lucario matchup, in order. A Hariyama with Energy on it is the piece that
@@ -204,6 +223,21 @@ BOSS_KILOWATTREL_REWARD = 0.070     # Bellibolt matchup, secondary
 BOSS_HARIYAMA_CHARGED_REWARD = 0.110
 BOSS_MAKUHITA_REWARD = 0.090
 BOSS_HARIYAMA_UNCHARGED_REWARD = 0.060
+# Extra on top of a named threat's constant when it is ALSO inside Superb
+# Scissors range -- i.e. this Boss converts straight into a knockout next
+# turn, not just an improved Active Spot.
+BOSS_NAMED_KO_BONUS = 0.050
+# Crustle mirror: a Crustle with less than attack-cost Energy can't hit back
+# at all if we drag it to Active, so it eats free damage every turn it stays
+# there. Sized close to a charged Hariyama since an unpunishable target is
+# just as valuable as a killable one.
+BOSS_MIRROR_LOW_ENERGY_REWARD = 0.150
+# Abomasnow matchup: always take their benched Kyogre with the most Energy on
+# it, full HP or not. UNVERIFIED -- ABOMASNOW and KYOGRE ids below are not
+# confirmed against Card_ID_List_EN.pdf the way the rest of this file's ids
+# are, so this branch is a best-effort placeholder; fix the ids before relying
+# on it in a real run.
+BOSS_ABOMASNOW_KYOGRE_REWARD = 0.120
 BOSS_KO_RANGE_REWARD = 0.030        # generic: inside Superb Scissors
 BOSS_MULTI_PRIZE_REWARD = 0.030
 # Fallback ordering when nothing named is available: weakest target first,
@@ -214,21 +248,48 @@ BOSS_WASTED_PENALTY = 0.020
 # Boss is scored as an IMPROVEMENT on their Active Spot, not on the new target
 # in isolation. Dragging up something no better than what was already standing
 # there spends the turn's Supporter to accomplish nothing -- or worse, swaps a
-# threat we could kill for one we cannot.
+# threat we could kill for one we cannot. This also covers giving up a FREE
+# knockout: if the Pokemon already Active was inside KO range and Boss dragged
+# up a fresh full-HP body instead, that is always a downgrade, named target or
+# not -- see the guard in _boss_reward.
 BOSS_DOWNGRADE_PENALTY = 0.060
 
 # ── Tempo / targeting ─────────────────────────────────────────────────────
 # Switch only pays when it actually lands a *built* Crustle in the Active
 # Spot. The old version rewarded any swap out of a stuck Active, which the
-# agent was cashing on turn 1 by Switching Kangaskhan away for nothing.
+# agent was cashing on turn 1 by Switching Kangaskhan away for nothing. The
+# payout scales with how much Energy the landed Crustle is carrying (half at
+# attack cost, full at CRUSTLE_MAX_USEFUL_ENERGY) so a board with two ready
+# Crustles on the bench pulls the agent toward the fuller one, not just
+# whichever one clears the "built" bar first.
 SWITCH_TO_BUILT_CRUSTLE_REWARD = 0.040
+# Any other Switch -- one that does NOT land a built Crustle Active -- is a
+# card spent for nothing, whether that's shuffling Kangaskhan out at random or
+# swapping into an under-charged bench mon. The old version scored this 0.0,
+# which is exactly what let Switch get burned at random with nothing pulling
+# it back. Charged much harder in the mirror, where Switch is one of the
+# highest-value cards in the list (see SWITCH_KANGASKHAN_TO_CRUSTLE_MIRROR_
+# REWARD below), so wasting it there is a bigger relative mistake.
+SWITCH_WASTED_PENALTY = 0.015
+SWITCH_WASTED_MIRROR_PENALTY = 0.040
+# Crustle mirror: pulling a damaged/dead-weight Mega Kangaskhan ex out of the
+# Active Spot and dropping in a Crustle that can swing right into it is close
+# to the best single card play the deck has in that matchup -- Rock Inn is a
+# no-op mirror vs mirror, so the game is decided by who lands the first free
+# hits, and Switch does it instantly with no retreat cost paid and no attack
+# given up.
+SWITCH_KANGASKHAN_TO_CRUSTLE_MIRROR_REWARD = 0.100
 
 POKEGEAR_WANTED_REWARD = 0.020
 POKEGEAR_ANY_REWARD = 0.005
 
-LILLIE_BASE_REWARD = 0.060
-LILLIE_PER_CARD_DISCARDED = 0.010
-LILLIE_MAX_PENALTY = -0.030
+# Softened from (0.060, 0.010, -0.030): the old breakeven at a 6-card hand was
+# harsh enough that ordinary mid-game Lillie plays (not empty-handed, not
+# hoarding) scored negative on average, which showed up as a persistent
+# negative trend on reward/lillie even though nothing was actually broken.
+LILLIE_BASE_REWARD = 0.070
+LILLIE_PER_CARD_DISCARDED = 0.008
+LILLIE_MAX_PENALTY = -0.020
 
 # Under deck-out pressure Lillie's value inverts. It shuffles the hand back in
 # and draws 6, so the net change to the deck is (hand_size - 6): on a fat hand
@@ -248,14 +309,26 @@ TUTOR_ON_NEED_REWARD = 0.020
 # so the pressure has to land somewhere -- here, on actually going and getting
 # a Dwebble instead of settling in behind Kangaskhan.
 TUTOR_NO_LINE_REWARD = 0.050
+# Hilda gets a Pokemon AND an Energy off a single card; Ultra Ball only ever
+# gets the Pokemon, and pays for it by discarding 2 more cards on top. Hilda
+# was being under-used relative to Ultra Ball, so this tips the choice toward
+# Hilda whenever both are legal options.
+HILDA_TUTOR_BONUS = 0.020
 
-# Hilda searches out an Evolution Pokemon AND an Energy card, which makes it
-# the only card in the list that can go get a Mist Energy on demand. Against
-# Alakazam that is the whole matchup: Powerful Hand places damage counters,
-# Mist blanks attack effects on its holder, and we want all four found and
-# stuck on Kangaskhan as fast as possible. The reward decays per turn so
-# "asap" is actually encoded rather than just "eventually", and it scales with
-# how many Mist we still don't have -- the first one matters most.
+# Hilda searches out an Evolution Pokemon AND an Energy card in one play,
+# which makes it strictly better than Ultra Ball whenever both are live
+# options -- HILDA_TUTOR_BONUS above prices that comparison in. The Evolution
+# half can only ever fetch Crustle in this list (Dwebble is a Basic, not an
+# Evolution), and the Energy half is the only on-demand way to get either Mist
+# Energy (the whole Alakazam matchup) or Growing Grass Energy (HP now, attack
+# cost eventually) instead of top-decking one.
+HILDA_CRUSTLE_REWARD = 0.070
+HILDA_GRASS_ENERGY_REWARD = 0.035
+# Against Alakazam the Energy half is the whole matchup: Powerful Hand places
+# damage counters, Mist blanks attack effects on its holder, and we want all
+# four found and stuck on Kangaskhan as fast as possible. The reward decays
+# per turn so "asap" is actually encoded rather than just "eventually", and it
+# scales with how many Mist we still don't have -- the first one matters most.
 HILDA_MIST_VS_ALAKAZAM_REWARD = 0.250
 HILDA_MIST_DECAY_PER_TURN = 0.025
 HILDA_MIST_MIN_REWARD = 0.100
@@ -296,6 +369,12 @@ KANGASKHAN_ATTACK_VS_ALAKAZAM_REWARD = 0.040
 
 # ── Retreating ────────────────────────────────────────────────────────────
 RETREAT_ENERGY_PENALTY = 0.015
+# The good version of a retreat: Kangaskhan can't (or shouldn't be trusted to)
+# swing and a ready Crustle is waiting on the bench, so paying the retreat
+# cost to bring the attacker in is what the turn was for. Outranks the flat
+# energy-dump charge above rather than just discounting it -- this is the play
+# that transitions the game from "Kangaskhan draws" to "Crustle attacks".
+RETREAT_TO_READY_CRUSTLE_REWARD = 0.060
 
 # ── Deck-out ──────────────────────────────────────────────────────────────
 DECK_LOW_THRESHOLD = 8
@@ -387,15 +466,35 @@ ABRA_MEG = 741                 # MEG 54
 KADABRA_MEG = 742              # MEG 55
 ALAKAZAM_MEG = 743             # MEG 56  -- Powerful Hand
 
+# PLACEHOLDER IDS -- NOT VERIFIED against Card_ID_List_EN.pdf. Known only as
+# "Mega Abomasnow ex" and "Kyogre", both from the Mega Evolution (ME01) set;
+# the collector number in that set does not tell us the engine's internal
+# card id (compare MEGA_KANGASKHAN_EX = 756 for "MEG 104" -- no relation
+# between the two numbers). Replace these two with the real ids before
+# trusting BOSS_ABOMASNOW_KYOGRE_REWARD or MATCHUP_ABOMASNOW in a real run;
+# until then both fail safe (an id that matches nothing just never fires).
+MEGA_ABOMASNOW_EX = 9001       # ME01 -- Mega Abomasnow ex, UNVERIFIED id
+KYOGRE_ME01 = 9002             # ME01 -- Kyogre, UNVERIFIED id
+
 FROSLASS_LINE_IDS = (FROSLASS_TWM, SNORUNT_TWM, SNORUNT_ASC)
 ALAKAZAM_LINE_IDS = (ALAKAZAM_MEG, KADABRA_MEG, ABRA_MEG, ALAKAZAM_TWM, ABRA_TWM)
 BELLIBOLT_LINE_IDS = (IONOS_BELLIBOLT_EX, IONOS_VOLTORB, IONOS_KILOWATTREL)
 LUCARIO_LINE_IDS = (MEGA_LUCARIO_EX, MAKUHITA, HARIYAMA)
+ABOMASNOW_LINE_IDS = (MEGA_ABOMASNOW_EX,)
+
+# The deck's own line, for mirror-matchup detection -- their Crustle can hurt
+# ours (neither side is a Pokemon ex, so Rock Inn is a no-op mirror vs
+# mirror), which flips Switch and Boss's Orders into some of the highest-
+# value cards in the list. See _detect_matchup and the mirror branches in
+# _switch_reward / _boss_target_value.
+MIRROR_LINE_IDS = (MEGA_KANGASKHAN_EX, CRUSTLE, DWEBBLE)
 
 MATCHUP_GENERIC = "generic"
 MATCHUP_ALAKAZAM = "alakazam"
+MATCHUP_MIRROR = "mirror"
 MATCHUP_BELLIBOLT = "bellibolt"
 MATCHUP_LUCARIO = "lucario"
+MATCHUP_ABOMASNOW = "abomasnow"
 
 # Superb Scissors damage, for "can Crustle finish this?" checks. Ignores
 # Weakness and Resistance, same approximation the starmie file made.
@@ -407,11 +506,18 @@ KANGASKHAN_ATTACK_DAMAGE = 200
 
 CRUSTLE_ATTACK_DAMAGE = 120
 CRUSTLE_ATTACK_COST = 3        # {G}{C}{C} -- also crustle_agent.py's threshold
-# Attack cost is 3, but a Crustle is not "finished" at 3: every extra Growing
-# Grass Energy is another +20 HP on the wall. Energy past this ceiling is the
-# only point at which the Crustle line stops out-ranking Kangaskhan as an
-# attachment target.
+# Two ceilings, not one. CRUSTLE_MAX_USEFUL_ENERGY (5) is the "still chasing
+# HP" ceiling -- Growing Grass Energy is +20 HP a copy, so it is worth loading
+# a Crustle that hasn't found ANY grass yet all the way up to it. But once a
+# Crustle already has grass on it, attack cost (3) is the real cap: it can
+# already swing, and topping it off with anything else is no longer the
+# priority. See _crustle_energy_cap.
 CRUSTLE_MAX_USEFUL_ENERGY = 5
+# What an attach that lands ABOVE that Crustle's cap is worth. Still positive
+# -- a spare battery on the wall is never a real mistake -- just far below the
+# normal placement reward, so the agent stops treating every attach as equally
+# good once the line already has what it needs.
+CRUSTLE_ENERGY_OVER_CAP_REWARD = 0.003
 
 ENERGY_BONUS_BY_ID = {
     MIST_ENERGY: 0.012,        # blanks attack effects on the holder
@@ -546,8 +652,9 @@ def _board_snapshot(obs_dict, player_index):
 
 
 def _energy_gains(prev_obs, cur_obs, player_index):
-    """(receiving_pokemon_card_id, area, energy_card_id) for every Energy that
-    appeared on one of our Pokemon this step.
+    """(receiving_pokemon_card_id, area, energy_card_id, energy_count_after,
+    had_grass_before) for every Energy that appeared on one of our Pokemon
+    this step.
 
     Derived by diffing the board, NOT by reading the Attach log. The log's
     `cardIdTarget` is an inferred field, and when it is absent every
@@ -559,16 +666,30 @@ def _energy_gains(prev_obs, cur_obs, player_index):
     Also resolves bench-vs-active exactly, which the log could never do: with a
     Crustle in the Active Spot and another on the bench, cardIdTarget is the
     same value for both.
+
+    energy_count_after and had_grass_before are running values within this
+    step -- if more than one Energy landed on the same slot in one step (not
+    expected under one-attachment-per-turn, but not assumed either), the
+    second gain sees the first one already applied. That is what lets
+    _energy_terms grade each attach against CRUSTLE_MAX_USEFUL_ENERGY /
+    CRUSTLE_ATTACK_COST (see _crustle_energy_cap) without re-reading the
+    board itself.
     """
     prev_map = _board_snapshot(prev_obs, player_index)
     cur_map = _board_snapshot(cur_obs, player_index)
     gains = []
     for key, (card_id, area, counter, _mhp) in cur_map.items():
         before = prev_map.get(key, (None, None, Counter(), None))[2]
+        running_total = sum(before.values())
+        had_grass = any(before.get(gid, 0) > 0
+                         for gid in (GROW_GRASS_ENERGY, BASIC_GRASS_ENERGY))
         for energy_id, count in counter.items():
             added = count - before.get(energy_id, 0)
-            if added > 0:
-                gains.extend([(card_id, area, energy_id)] * added)
+            for _ in range(max(0, added)):
+                running_total += 1
+                gains.append((card_id, area, energy_id, running_total, had_grass))
+                if energy_id in (GROW_GRASS_ENERGY, BASIC_GRASS_ENERGY):
+                    had_grass = True
     return gains
 
 
@@ -845,15 +966,30 @@ def _ready_crustle_anywhere(obs_dict, player_index):
     return _built_crustle_count(obs_dict, player_index) > 0
 
 
+def _crustle_energy_cap(mon):
+    """How much Energy THIS Crustle-line body can still usefully hold.
+
+    Growing Grass Energy is +20 HP a copy and keeps paying past attack cost,
+    so a Crustle that hasn't found any grass yet is graded on the old, looser
+    ceiling (CRUSTLE_MAX_USEFUL_ENERGY). One that already has grass on it is
+    capped at attack cost (CRUSTLE_ATTACK_COST): it can already swing, and
+    everything past that is a spare battery, not the plan.
+    """
+    has_grass = any(_energy_id(e) in (GROW_GRASS_ENERGY, BASIC_GRASS_ENERGY)
+                     for e in _energies(mon))
+    return CRUSTLE_MAX_USEFUL_ENERGY if not has_grass else CRUSTLE_ATTACK_COST
+
+
 def _line_member_wants_energy(obs_dict, player_index):
     """Is there a Crustle-line body that could still use the attachment?
 
-    Uses CRUSTLE_MAX_USEFUL_ENERGY, not attack cost. A Crustle sitting on
-    exactly 3 is ready to swing but not yet big -- treating it as "done" was
-    what let energy-onto-Kangaskhan escape the full penalty.
+    Uses _crustle_energy_cap, not a flat threshold -- a Crustle sitting on
+    exactly 3 with grass already attached is ready to swing AND capped, so
+    treating it as still "wanting" energy is what let energy-onto-Kangaskhan
+    escape the full penalty even after the line was actually served.
     """
     for m in _pokemon_in_play(obs_dict, player_index):
-        if m.get("id") in CRUSTLE_LINE_IDS and len(_energies(m)) < CRUSTLE_MAX_USEFUL_ENERGY:
+        if m.get("id") in CRUSTLE_LINE_IDS and len(_energies(m)) < _crustle_energy_cap(m):
             return True
     return False
 
@@ -862,7 +998,7 @@ def _bench_line_wants_energy(obs_dict, player_index):
     """Same test restricted to the Bench -- the thing that decides whether an
     attach to the Active Crustle was the wrong choice."""
     for m in _bench_pokemon(obs_dict, player_index):
-        if m.get("id") in CRUSTLE_LINE_IDS and len(_energies(m)) < CRUSTLE_MAX_USEFUL_ENERGY:
+        if m.get("id") in CRUSTLE_LINE_IDS and len(_energies(m)) < _crustle_energy_cap(m):
             return True
     return False
 
@@ -981,12 +1117,30 @@ def _detect_matchup(obs_dict, opp_index):
     board AND discard, so a Kadabra that already evolved still counts.
 
     Checked in priority order: Alakazam first because it is the one matchup
-    that inverts the whole gameplan, so a mis-tag there is the costliest.
+    that inverts the whole gameplan, so a mis-tag there is the costliest, then
+    the mirror (their deck IS our deck, which flips several tempo cards).
+
+    KNOWN GAP: Kadabra TWM (TWM 81, between ABRA_TWM and ALAKAZAM_TWM in that
+    evolution line) has no id defined anywhere in this file -- unlike the MEG
+    printing, which has all three stages. Evolution replaces the mon in place
+    rather than discarding the lower stage, so a game where the TWM Alakazam
+    line is sitting mid-evolution as Kadabra is invisible to `seen` until it
+    evolves again, and matchup detection (and everything gated on
+    MATCHUP_ALAKAZAM, including mist_vs_alakazam) stays MATCHUP_GENERIC until
+    then. Add KADABRA_TWM's real id here once it's confirmed against
+    Card_ID_List_EN.pdf -- do not guess it.
+
+    ABOMASNOW_LINE_IDS is currently a single UNVERIFIED placeholder id (see
+    its definition) and will not match anything in a real game until fixed.
     """
     seen = set(_discard_ids(obs_dict, opp_index))
     seen.update(m.get("id") for m in _pokemon_in_play(obs_dict, opp_index))
     if seen & set(ALAKAZAM_LINE_IDS):
         return MATCHUP_ALAKAZAM
+    if seen & set(MIRROR_LINE_IDS):
+        return MATCHUP_MIRROR
+    if seen & set(ABOMASNOW_LINE_IDS):
+        return MATCHUP_ABOMASNOW
     if seen & set(BELLIBOLT_LINE_IDS):
         return MATCHUP_BELLIBOLT
     if seen & set(LUCARIO_LINE_IDS):
@@ -1069,9 +1223,27 @@ def _update_matchup(cur_obs, me_index, opp_index):
     return _matchup[me_index]
 
 
+def _turn_owner(obs_dict):
+    """INFERRED: index of the player whose turn it currently is.
+    `current.yourIndex` is the field the rest of this function assumes exists;
+    if the engine names it differently, the turn-end branch below never fires
+    and run_errand / no_attack silently stay at 0.0 for the entire run -- which
+    is exactly the failure mode reward/run_errand showed. Falls back to
+    sibling key names before giving up and returning None (which reproduces
+    the old always-0 behavior rather than raising). Prefer confirming the real
+    field against a live obs dump and dropping the fallbacks once you have."""
+    current = obs_dict.get("current") or {}
+    for key in ("yourIndex", "currentPlayerIndex", "activePlayerIndex",
+                "turnPlayerIndex", "turnIndex"):
+        val = current.get(key)
+        if isinstance(val, int):
+            return val
+    return None
+
+
 def _turn_end_penalties(prev_obs, cur_obs, me_index, matchup):
     """(run_errand, no_attack) -- both settle on turn hand-off, read off
-    current.yourIndex flipping away from us.
+    _turn_owner (current.yourIndex, with fallbacks) flipping away from us.
 
     run_errand: a turn that held Kangaskhan Active without drawing off Run
     Errand. Deliberately conservative -- draws from Lillie, Petrel or Team
@@ -1094,7 +1266,7 @@ def _turn_end_penalties(prev_obs, cur_obs, me_index, matchup):
     if _active_should_attack(prev_obs, me_index, matchup):
         _turn_could_attack[me_index] = True
 
-    if (cur_obs.get("current") or {}).get("yourIndex") == me_index:
+    if _turn_owner(cur_obs) == me_index:
         return 0.0, 0.0
 
     _turns_taken[me_index] = _turns_taken.get(me_index, 0) + 1
@@ -1117,14 +1289,27 @@ def _turn_end_penalties(prev_obs, cur_obs, me_index, matchup):
 def _lead_reward(prev_obs, cur_obs, me_index):
     """One-shot bonus for the opening Active being Kangaskhan -- true in every
     matchup, including Alakazam, where it is also the attacker. Grades the
-    earliest board state this function sees."""
+    earliest board state this function sees.
+
+    The wrong-lead penalty only fires if Kangaskhan was actually in the
+    opening hand -- if it got prized instead, leading with anything else
+    isn't a choice the agent had. Charging it anyway added an irreducible
+    charge Kangaskhan-prized games via 6-card RNG that no policy improvement
+    could ever remove, which is what showed up as a persistent negative floor
+    on reward/lead rather than a real regression.
+    """
     if _lead_scored.get(me_index):
         return 0.0
     mon = _active_pokemon(prev_obs, me_index) or _active_pokemon(cur_obs, me_index)
     if not mon:
         return 0.0
     _lead_scored[me_index] = True
-    return LEAD_KANGASKHAN_REWARD if mon.get("id") == MEGA_KANGASKHAN_EX else -LEAD_WRONG_PENALTY
+    if mon.get("id") == MEGA_KANGASKHAN_EX:
+        return LEAD_KANGASKHAN_REWARD
+    hand = set(_hand_ids(prev_obs, me_index)) | set(_hand_ids(cur_obs, me_index))
+    if MEGA_KANGASKHAN_EX not in hand:
+        return 0.0
+    return -LEAD_WRONG_PENALTY
 
 
 # ── Term helpers ──────────────────────────────────────────────────────────
@@ -1173,11 +1358,24 @@ def _energy_terms(prev_obs, cur_obs, me_index, opp_index, matchup):
         if m.get("id") == MEGA_KANGASKHAN_EX
     )
 
-    for target_id, area, energy_id in _energy_gains(prev_obs, cur_obs, me_index):
+    for target_id, area, energy_id, energy_after, had_grass_before in _energy_gains(
+            prev_obs, cur_obs, me_index):
         attach_reward += ENERGY_ATTACH_REWARD + ENERGY_BONUS_BY_ID.get(energy_id, 0.0)
 
         if target_id in CRUSTLE_LINE_IDS:
-            if area == "bench":
+            # Mist is a fine defensive attach on a Crustle even outside its
+            # normal role; against Alakazam specifically it is graded on the
+            # looser ceiling rather than the tightened attack-cost one, since
+            # Crustle is not the gameplan there and there's no reason to rush
+            # the cap on it.
+            if vs_zam and energy_id == MIST_ENERGY:
+                cap = CRUSTLE_MAX_USEFUL_ENERGY
+            else:
+                cap = CRUSTLE_MAX_USEFUL_ENERGY if not had_grass_before else CRUSTLE_ATTACK_COST
+
+            if energy_after > cap:
+                placement = CRUSTLE_ENERGY_OVER_CAP_REWARD
+            elif area == "bench":
                 placement = ENERGY_ON_BENCH_CRUSTLE_REWARD
             elif bench_wants:
                 # A bench Crustle was still hungry and we fed the Active one.
@@ -1339,15 +1537,21 @@ def _boss_target_value(mon, matchup, can_punish):
     hp = mon.get("hp")
     in_ko_range = isinstance(hp, (int, float)) and hp <= CRUSTLE_ATTACK_DAMAGE
 
-    # A named threat's constant IS its priority, and nothing is added on top.
-    # Letting the generic in-KO-range bonus stack was reshuffling the intended
-    # order: an 80 HP Makuhita picked up +0.03 that a 140 HP charged Hariyama
-    # could not, which flipped the two.
+    # A named threat's constant IS its priority, with one addition: being
+    # ALSO inside KO range on top of being named means this Boss converts
+    # straight into a knockout, which is worth more than just improving the
+    # Active Spot (BOSS_NAMED_KO_BONUS). Letting the generic in-KO-range bonus
+    # stack unconditionally used to reshuffle the intended order: an 80 HP
+    # Makuhita picked up +0.03 that a 140 HP charged Hariyama could not, which
+    # flipped the two -- the bonus here is per-branch on purpose.
     named = 0.0
     if cid in FROSLASS_LINE_IDS:
         # Froslass chips our Crustles through Rock Inn every Checkup -- the one
         # card that beats the gameplan by ignoring it, and it dies to 120.
-        named = BOSS_FROSLASS_REWARD
+        # Unconditional and matchup-agnostic on purpose: it turns up as a tech
+        # in other lists too (Grimmsnarl among them), and it should always be
+        # the pick over anything else on their bench.
+        named = BOSS_FROSLASS_REWARD + (BOSS_NAMED_KO_BONUS if in_ko_range else 0.0)
     elif matchup == MATCHUP_BELLIBOLT and can_punish and in_ko_range:
         if cid == IONOS_VOLTORB:
             named = BOSS_VOLTORB_REWARD
@@ -1357,8 +1561,22 @@ def _boss_target_value(mon, matchup, can_punish):
         if cid == HARIYAMA:
             named = (BOSS_HARIYAMA_CHARGED_REWARD if _energies(mon)
                      else BOSS_HARIYAMA_UNCHARGED_REWARD)
+            if in_ko_range:
+                named += BOSS_NAMED_KO_BONUS
         elif cid == MAKUHITA:
             named = BOSS_MAKUHITA_REWARD
+            if in_ko_range:
+                named += BOSS_NAMED_KO_BONUS
+    elif matchup == MATCHUP_MIRROR and can_punish and cid == CRUSTLE:
+        # An under-charged mirror Crustle can't hit back at all if it's the
+        # one standing Active -- free damage every turn it stays there.
+        if len(_energies(mon)) < CRUSTLE_ATTACK_COST:
+            named = BOSS_MIRROR_LOW_ENERGY_REWARD
+    elif matchup == MATCHUP_ABOMASNOW and cid == KYOGRE_ME01:
+        # Always the pick against Abomasnow, full HP or not -- prefer the
+        # bench copy carrying the most Energy (the one closest to attacking).
+        # UNVERIFIED id, see KYOGRE_ME01's definition.
+        named = BOSS_ABOMASNOW_KYOGRE_REWARD + 0.001 * len(_energies(mon))
     if named > 0.0:
         return named
 
@@ -1400,6 +1618,23 @@ def _boss_reward(prev_obs, cur_obs, me_index, opp_index, my_discards, matchup):
 
     can_punish = _ready_crustle_anywhere(prev_obs, me_index)
     before = _active_pokemon(prev_obs, opp_index)
+
+    # Giving up a FREE knockout. If whatever was already Active was inside
+    # Superb Scissors range and we could already punish it, the only reason to
+    # spend Boss's Orders is to drag up something ALSO in range -- a bigger or
+    # multi-prize kill. Trading that guaranteed KO for a fresh full-HP body,
+    # named threat or not, undoes real progress instead of making any -- this
+    # is the case that let the bot boss up a full-HP target while the current
+    # Active (sometimes the very same species) was already sitting in KO
+    # range.
+    before_hp = before.get("hp") if before is not None else None
+    before_in_ko_range = (can_punish and isinstance(before_hp, (int, float))
+                           and before_hp <= CRUSTLE_ATTACK_DAMAGE)
+    target_hp = target.get("hp")
+    target_in_ko_range = isinstance(target_hp, (int, float)) and target_hp <= CRUSTLE_ATTACK_DAMAGE
+    if before_in_ko_range and not target_in_ko_range:
+        return -BOSS_DOWNGRADE_PENALTY
+
     new_value = _boss_target_value(target, matchup, can_punish)
     old_value = _boss_target_value(before, matchup, can_punish)
 
@@ -1415,18 +1650,41 @@ def _boss_reward(prev_obs, cur_obs, me_index, opp_index, my_discards, matchup):
     return gain
 
 
-def _switch_reward(cur_obs, me_index, my_discards):
+def _switch_reward(prev_obs, cur_obs, me_index, my_discards, matchup):
     """Only pays when the Switch actually LANDS a built Crustle in the Active
     Spot. The previous version rewarded any swap out of a "stuck" Active,
     which the agent was cashing on turn 1 by Switching Kangaskhan away for
-    nothing -- grading the post-switch board removes that entirely."""
+    nothing -- grading the post-switch board removes that entirely.
+
+    A Switch that does NOT land a built Crustle is now charged rather than
+    left neutral -- the old 0.0 was what let Switch get burned at random
+    (including on a Kangaskhan Active that was doing its job) with nothing
+    pulling the agent back. In the mirror the whole card is worth far more
+    (see SWITCH_KANGASKHAN_TO_CRUSTLE_MIRROR_REWARD's definition), so both the
+    miss-penalty and the specific Kangaskhan-out play are scaled up there.
+    """
     if SWITCH not in my_discards:
         return 0.0
+    prev_active = _active_pokemon(prev_obs, me_index)
     mon = _active_pokemon(cur_obs, me_index)
-    if (mon and mon.get("id") == CRUSTLE
-            and len(_energies(mon)) >= CRUSTLE_ATTACK_COST):
-        return SWITCH_TO_BUILT_CRUSTLE_REWARD
-    return 0.0
+    energy = len(_energies(mon)) if mon else 0
+    landed_ready_crustle = bool(mon and mon.get("id") == CRUSTLE and energy >= CRUSTLE_ATTACK_COST)
+
+    if matchup == MATCHUP_MIRROR:
+        if (landed_ready_crustle and prev_active is not None
+                and prev_active.get("id") == MEGA_KANGASKHAN_EX):
+            fill = min(1.0, energy / CRUSTLE_MAX_USEFUL_ENERGY)
+            return SWITCH_KANGASKHAN_TO_CRUSTLE_MIRROR_REWARD * (0.6 + 0.4 * fill)
+        if not landed_ready_crustle:
+            return -SWITCH_WASTED_MIRROR_PENALTY
+
+    if not landed_ready_crustle:
+        return -SWITCH_WASTED_PENALTY
+
+    # Prefer the fuller Crustle when more than one is switch-in eligible: half
+    # the reward right at attack cost, all of it at the HP-chasing ceiling.
+    fill = min(1.0, energy / CRUSTLE_MAX_USEFUL_ENERGY)
+    return SWITCH_TO_BUILT_CRUSTLE_REWARD * (0.5 + 0.5 * fill)
 
 
 def _pokegear_reward(prev_obs, cur_obs, me_index, opp_index, my_discards, matchup):
@@ -1468,31 +1726,49 @@ def _lillie_reward(prev_obs, me_index, my_discards):
     return max(LILLIE_MAX_PENALTY, LILLIE_BASE_REWARD - LILLIE_PER_CARD_DISCARDED * hand_before)
 
 
-def _hilda_mist_reward(prev_obs, cur_obs, me_index, my_discards, matchup):
-    """Hilda actually fetching a Mist Energy.
+def _hilda_reward(prev_obs, cur_obs, me_index, my_discards, matchup):
+    """Hilda actually fetching a Crustle, a Growing Grass Energy, or a Mist
+    Energy -- the three things this deck actually wants out of it, priced
+    separately so the term stops under-rewarding the two-thirds of Hilda's
+    value (Crustle, grass) that used to score nothing at all.
 
-    Paid on the fetch; attaching it to Kangaskhan is paid separately by the
-    mist_vs_alakazam term, so the full Hilda -> Mist -> Kangaskhan chain
-    collects both. Against Alakazam the payout decays with every turn that has
-    already passed and shrinks as we accumulate copies, so the gradient points
-    at "find all four early" rather than "find one eventually".
+    Paid on the fetch; attaching an Energy is paid separately by the relevant
+    energy_target / mist_vs_alakazam term, so the full Hilda -> card ->
+    board chain collects both. Against Alakazam the Mist payout decays with
+    every turn that has already passed and shrinks as we accumulate copies
+    (smoothed continuously rather than in hard steps -- see the urgency
+    line below), so the gradient points at "find all four early" rather than
+    "find one eventually".
     """
     if HILDA not in my_discards:
         return 0.0
-    found = sum(1 for cid in _newly_in_hand_ids(prev_obs, cur_obs, me_index)
-                if cid == MIST_ENERGY)
-    if found <= 0:
+    gained = _newly_in_hand_ids(prev_obs, cur_obs, me_index)
+    if not gained:
         return 0.0
+
+    reward = 0.0
+    if CRUSTLE in gained:
+        reward += HILDA_CRUSTLE_REWARD
+    reward += HILDA_GRASS_ENERGY_REWARD * sum(1 for cid in gained if cid == GROW_GRASS_ENERGY)
+
+    mist_found = sum(1 for cid in gained if cid == MIST_ENERGY)
+    if mist_found <= 0:
+        return reward
     if matchup != MATCHUP_ALAKAZAM:
-        return HILDA_MIST_REWARD * found
+        return reward + HILDA_MIST_REWARD * mist_found
 
     per_copy = max(HILDA_MIST_MIN_REWARD,
                    HILDA_MIST_VS_ALAKAZAM_REWARD
                    - HILDA_MIST_DECAY_PER_TURN * _turns_taken.get(me_index, 0))
-    # The copies we don't have yet are the urgent ones.
+    # The copies we don't have yet are the urgent ones. Continuous in
+    # still_missing (0.5 at 0 missing up to 1.0 at all 4 missing) rather than
+    # the old hard 0.5/0.75/1.0 steps, which were a real source of the jagged,
+    # noisy-looking reward/hilda_mist series -- two otherwise-similar fetches
+    # a turn apart could land on opposite sides of a step and look like noise
+    # rather than the smooth "find them early" signal this is meant to be.
     still_missing = max(0, 4 - _mist_secured(prev_obs, me_index))
-    urgency = 1.0 if still_missing >= 3 else (0.75 if still_missing == 2 else 0.5)
-    return per_copy * urgency * found * ALAKAZAM_MIST_EMPHASIS
+    urgency = 0.5 + 0.125 * still_missing
+    return reward + per_copy * urgency * mist_found * ALAKAZAM_MIST_EMPHASIS
 
 
 def _tutor_reward(prev_obs, me_index, my_discards):
@@ -1507,10 +1783,24 @@ def _tutor_reward(prev_obs, me_index, my_discards):
     # is nothing to build, Kangaskhan soaks the energy by default, and the
     # whole gameplan is stalled until a body shows up.
     payout = TUTOR_NO_LINE_REWARD if line_count == 0 else TUTOR_ON_NEED_REWARD
+    hand = set(_hand_ids(prev_obs, me_index))
+    # Nothing left in hand that can put a body down except Petrel digging for
+    # a Poffin -- see PETREL_LAST_RESORT_REWARD.
+    no_dwebble_access = (line_count == 0
+                          and not (hand & {DWEBBLE, BUDDY_BUDDY_POFFIN, ULTRA_BALL}))
     for cid in my_discards:
-        if cid in (ULTRA_BALL, HILDA) and (stranded or short_of_pair):
+        if cid == HILDA and (stranded or short_of_pair):
+            # A Pokemon AND an Energy off one card beats Ultra Ball's Pokemon-
+            # only for the same slot, so it gets a bit extra on top.
+            reward += payout + HILDA_TUTOR_BONUS
+        elif cid == ULTRA_BALL and (stranded or short_of_pair):
             reward += payout
-        elif cid in (TEAM_ROCKETS_PETREL, BUDDY_BUDDY_POFFIN):
+        elif cid == TEAM_ROCKETS_PETREL:
+            if no_dwebble_access:
+                reward += payout + PETREL_LAST_RESORT_REWARD
+            elif short_of_pair or _wants_ice_cream(prev_obs, me_index):
+                reward += payout
+        elif cid == BUDDY_BUDDY_POFFIN:
             if short_of_pair or _wants_ice_cream(prev_obs, me_index):
                 reward += payout
     return reward
@@ -1604,8 +1894,14 @@ def _active_identity(obs_dict, player_index):
     return mon.get("serial", mon.get("id"))
 
 
-def _retreat_penalty(prev_obs, cur_obs, me_index, my_discards, opp_took):
-    """Charge for Energy dumped paying a retreat cost.
+def _retreat_reward(prev_obs, cur_obs, me_index, my_discards, opp_took, matchup):
+    """Grade a retreat: charge for Energy dumped paying the cost, EXCEPT the
+    one retreat this deck actually wants -- Kangaskhan can't (or shouldn't be
+    trusted to) attack and a ready Crustle is waiting on the bench, which is
+    the transition from "Kangaskhan draws" to "Crustle attacks". That specific
+    retreat pays a flat reward instead of the energy charge, which is what the
+    old unconditional version was missing (it charged every retreat the same
+    way regardless of whether it was the correct play).
 
     INFERRED: there is no Retreat log type in the set this file reads, so a
     retreat is inferred from "our Active changed, our own Energy hit the
@@ -1617,7 +1913,24 @@ def _retreat_penalty(prev_obs, cur_obs, me_index, my_discards, opp_took):
         return 0.0
     if _active_identity(prev_obs, me_index) == _active_identity(cur_obs, me_index):
         return 0.0
-    return RETREAT_ENERGY_PENALTY * sum(1 for cid in my_discards if _is_energy_card(cid))
+
+    prev_active = _active_pokemon(prev_obs, me_index)
+    new_active = _active_pokemon(cur_obs, me_index)
+    landed_ready_crustle = (new_active is not None and new_active.get("id") == CRUSTLE
+                             and len(_energies(new_active)) >= CRUSTLE_ATTACK_COST)
+
+    if (matchup != MATCHUP_ALAKAZAM and landed_ready_crustle
+            and prev_active is not None and prev_active.get("id") == MEGA_KANGASKHAN_EX):
+        unable_to_attack = (len(_energies(prev_active)) < KANGASKHAN_ATTACK_COST
+                             or _has_special_condition(prev_active, "ASLEEP")
+                             or _has_special_condition(prev_active, "PARALY"))
+        hp, max_hp = prev_active.get("hp"), prev_active.get("maxHp")
+        damaged = (isinstance(hp, (int, float)) and isinstance(max_hp, (int, float))
+                   and hp < max_hp)
+        if (unable_to_attack or damaged) and _ready_crustle_on_bench(prev_obs, me_index):
+            return RETREAT_TO_READY_CRUSTLE_REWARD
+
+    return -RETREAT_ENERGY_PENALTY * sum(1 for cid in my_discards if _is_energy_card(cid))
 
 
 def _deck_out_penalty(prev_obs, cur_obs, me_index):
@@ -1710,8 +2023,14 @@ def _stadium_reward(prev_obs, cur_obs, me_index, opp_index):
 
 
 def _supporter_played_count(prev_obs, cur_obs, player_index):
+    """Flat per-Supporter reward for playing ANY Supporter this turn --
+    EXCEPT Boss's Orders, which already has its own discerning reward
+    (_boss_reward). Stacking the flat bonus on top of a bad Boss play was
+    softening the penalty for dragging up a bad target, which is exactly the
+    "just Boss whatever, it still pays a little" behavior this exclusion
+    exists to stop encouraging."""
     return sum(1 for cid in _newly_discarded_ids(prev_obs, cur_obs, player_index)
-               if _is_supporter_card(cid))
+               if _is_supporter_card(cid) and cid != BOSSS_ORDERS)
 
 
 # Fixed key set so the logger writes a COMPLETE series every rollout -- a term
@@ -1811,11 +2130,11 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
         "xerosic": _xerosic_reward(prev_obs, cur_obs, opp_index, my_discards),
         "hand_trimmer": _hand_trimmer_reward(prev_obs, cur_obs, me_index, opp_index, my_discards),
         "boss": _boss_reward(prev_obs, cur_obs, me_index, opp_index, my_discards, matchup),
-        "switch_to_crustle": _switch_reward(cur_obs, me_index, my_discards),
+        "switch_to_crustle": _switch_reward(prev_obs, cur_obs, me_index, my_discards, matchup),
         "pokegear": _pokegear_reward(prev_obs, cur_obs, me_index, opp_index, my_discards, matchup),
         "lillie": _lillie_reward(prev_obs, me_index, my_discards),
         "tutor": _tutor_reward(prev_obs, me_index, my_discards),
-        "hilda_mist": _hilda_mist_reward(
+        "hilda_mist": _hilda_reward(
             prev_obs, cur_obs, me_index, my_discards, matchup),
         "promotion": _promotion_reward(prev_obs, cur_obs, me_index, opp_took, matchup),
         "stadium": _stadium_reward(prev_obs, cur_obs, me_index, opp_index),
@@ -1826,7 +2145,7 @@ def reward_terms(prev_obs, cur_obs, done, result, me_index):
         "kangaskhan_attack": _kangaskhan_attack_term(prev_obs, cur_obs, me_index, matchup),
         "wall_matchup": _wall_matchup_reward(prev_obs, cur_obs, me_index, opp_index),
         "setup_tempo": _setup_tempo_reward(cur_obs, me_index),
-        "retreat": -_retreat_penalty(prev_obs, cur_obs, me_index, my_discards, opp_took),
+        "retreat": _retreat_reward(prev_obs, cur_obs, me_index, my_discards, opp_took, matchup),
         "deck_out": -_deck_out_penalty(prev_obs, cur_obs, me_index),
         "run_errand": -run_errand,
         "no_attack": -no_attack,
