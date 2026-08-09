@@ -560,15 +560,47 @@ def _player(obs_dict, player_index):
 
 
 def _energies(mon):
-    """Energy cards attached to a Pokemon dict.
+    """Energy CARDS attached to a Pokemon dict.
 
-    crustle_agent.py's typed API exposes `Pokemon.energies`, so "energies" is
-    the likely raw key; "energyCards" (what the starmie file hardcodes) and
-    "energy" are fallbacks. Returns [] rather than raising.
+    "energyCards" is the authority, not "energies". Both keys are always
+    present on a board Pokemon and always the same length, but they hold
+    different things:
+
+        {"id": 756, "energies": [0, 1, 0],
+         "energyCards": [{"id": 14, ...}, {"id": 18, ...}, {"id": 11, ...}]}
+
+    "energies" is a list of energy TYPE enums (0 Colorless, 1 Grass, 5
+    Psychic); only "energyCards" carries real Card_ID_List_EN ids. This
+    function used to prefer "energies" -- a guess from crustle_agent.py's
+    typed `Pokemon.energies` -- which silently zeroed every id-aware Energy
+    branch in this file, since `_energy_id(e) == MIST_ENERGY` was comparing a
+    type enum against card id 11 and could never be true. That is why
+    reward/mist_vs_alakazam was exactly 0.0 at all 872 logged points of
+    MaskablePPO_22's 25M steps, and why ENERGY_BONUS_BY_ID never paid out.
+    The rest of the repo already had this right (obs_vectorizer.py,
+    rewards.py, the baa/ heuristics all read energyCards for ids and
+    `len(energies)` for counts).
+
+    Because the two lists are the same length, the many `len(_energies(...))`
+    call sites (attack cost, energy caps, Boss target ranking) were correct
+    either way and are unaffected by this change. Only the id reads --
+    _has_mist, _mist_secured, _crustle_energy_cap's grass check,
+    _board_snapshot/_energy_gains, and everything downstream of them -- change
+    behavior.
+
+    energyCards wins even when empty; a Pokemon with no attached Energy has
+    both lists empty, so falling through to "energies" there could only
+    resurrect the type-enum form. "energies"/"energy" remain as fallbacks for
+    an observation that lacks energyCards entirely, where a correct count is
+    still better than nothing (ids read off that path are still type enums and
+    will not match any card constant). Returns [] rather than raising.
     """
     if not isinstance(mon, dict):
         return []
-    for key in ("energies", "energyCards", "energy"):
+    cards = mon.get("energyCards")
+    if cards is not None:
+        return list(cards)
+    for key in ("energies", "energy"):
         val = mon.get(key)
         if val:
             return list(val)
