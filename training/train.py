@@ -17,6 +17,7 @@ from training.cabt_env import (
 )
 from training.callbacks import RewardTermCallback, SnapshotCallback, WinRateCallback
 from training.league import SnapshotOpponentPool
+from training.ppo_opponent import PPOOpponent
 
 from heuristics.crustle_agent import agent as crustle_agent
 from heuristics.abomasnow_agent import agent as abomasnow_agent
@@ -24,7 +25,6 @@ from heuristics.dragapult_agent import agent as dragapult_agent
 from heuristics.dragapult_v2_agent import agent as dragapult_v2_agent
 from heuristics.iono_agent import agent as iono_agent
 from heuristics.archaludon_agent import agent as archaludon_agent
-from heuristics.alakazam_agent import agent as alakazam_agent
 from heuristics.alakazam_v2_agent import agent as alakazam_v2_agent
 from heuristics.starmie_agent import agent as starmie_agent
 from heuristics.grimmsnarl_agent import agent as grimmsnarl_agent
@@ -36,7 +36,7 @@ import heuristics.alakazam_v2_agent.alakazam_v2_agent as _alakazam_v2_module
 # search_begin_input, so it really runs here -- measured in this env at 10.5s
 # of search out of 10.8s total for 2 episodes, versus 0.4s for the same two
 # episodes with it off (~27x). Opponents are drawn uniformly per episode, so
-# leaving it on would let one of eleven opponents eat the large majority of all
+# leaving it on would let one of ten opponents eat the large majority of all
 # rollout wall-clock. The heuristic core -- tuned weights, the Hammer-aware
 # lethal search, the Teleportation guard -- is unaffected by this flag; only
 # the minimax is. Set ALAKAZAM_V2_SEARCH=1 to train against the full agent.
@@ -90,17 +90,23 @@ def _load_deck(path):
     return deck
 
 
-# Heuristic opponent pool: one is drawn at random each episode (see CabtEnv).
+# Fixed opponent pool: one is drawn at random each episode (see CabtEnv).
 # Each entry is (name, agent_fn, deck) and the opponent pilots its OWN deck --
 # a heuristic piloting a foreign deck wouldn't exercise the strategy it was
-# written for. The learner always plays the LEARNER_DECK_PATH deck.
+# written for. The learner always plays the LEARNER_DECK_PATH deck. Mostly
+# heuristics, plus one frozen PPO checkpoint (ppo_starmie, see below); "the
+# heuristics" in the surrounding comments and in WinRateCallback's "overall"
+# bucket means this whole pool, as opposed to the league.
 #
 # An entry may add a 4th element, a relative sampling weight (default 1.0), to
-# skew how often that matchup comes up: lucario is at 2.0 and iono at 0.25
-# below, i.e. lucario is faced twice as often as a default opponent and iono a
-# quarter as often. Weights are relative and normalized over the whole pool,
-# so with these two set the eleven entries no longer split episodes evenly --
-# read win_rate/<name> per opponent rather than assuming equal sample counts.
+# skew how often that matchup comes up: lucario and alakazam_v2 are at 2.0,
+# ppo_starmie at 0.5 and iono at 0.25 below, i.e. lucario is faced twice as
+# often as a default opponent and iono a quarter as often. Weights are relative
+# and normalized over the whole pool, so with these set the eleven entries no
+# longer split episodes evenly -- read win_rate/<name> per opponent rather than
+# assuming equal sample counts.
+_STARMIE_DECK = _load_deck("heuristics/starmie_agent/deck.csv")
+
 OPPONENT_POOL = [
     ("crustle", crustle_agent, _load_deck("heuristics/crustle_agent/deck.csv")),
     ("abomasnow", abomasnow_agent, _load_deck("heuristics/abomasnow_agent/deck.csv")),
@@ -119,13 +125,32 @@ OPPONENT_POOL = [
     # ragingbolt is excluded for now: its discard logic is buggy (returns 2
     # picks on "discard exactly 3", IndexError on some board states), so it
     # plays artificially weak and inflates win rates. Re-add once fixed.
-    ("alakazam", alakazam_agent, _load_deck("heuristics/alakazam_agent/deck.csv")),
     (
         "alakazam_v2",
         alakazam_v2_agent,
         _load_deck("heuristics/alakazam_v2_agent/deck.csv"),
+        2.0,
     ),
-    ("starmie", starmie_agent, _load_deck("heuristics/starmie_agent/deck.csv")),
+    ("starmie", starmie_agent, _STARMIE_DECK),
+    # The one non-heuristic entry: a finished PPO run from this repo
+    # (ppo_starmie_v16, piloting the same starmie list its heuristic namesake
+    # above plays) pinned in as a fixed opponent. The heuristics cap out at
+    # whatever their authors hand-coded, and the league only ever offers this
+    # run's own past selves, so without this the learner never faces a strong
+    # *learned* policy that isn't a near-copy of itself. Note v16 predates the
+    # lookahead features in obs_vectorizer -- PPOOpponent slices its older,
+    # narrower observation out of the current one (see its docstring), so it
+    # plays at the strength it was trained at rather than being fed a vector
+    # it cannot read. Weighted 0.5: it is the most expensive opponent here (a
+    # 256x256 forward pass plus a full vectorization per pick, versus a
+    # heuristic's dict lookups), and unlike the heuristics it doesn't add a
+    # new archetype -- starmie is already represented directly above.
+    (
+        "ppo_starmie",
+        PPOOpponent("ppo_starmie_v16_weights.npz", _STARMIE_DECK, name="ppo_starmie"),
+        _STARMIE_DECK,
+        0.5,
+    ),
     (
         "grimmsnarl",
         grimmsnarl_agent,
