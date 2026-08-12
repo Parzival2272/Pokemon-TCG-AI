@@ -3,7 +3,7 @@
 interface so it can be dropped into main.py's AGENTS dict.
 
 The shipped default is the Mega Kangaskhan ex / Crustle policy
-(models/ppo_crustle_v2_weights.npz), trained on crustle_deck.csv -- which is
+(models/ppo_crustle_v5_weights.npz), trained on crustle_deck.csv -- which is
 what the root deck.csv must be a copy of, since the observation's prize-belief
 block is computed against the deck loaded below.
 
@@ -64,12 +64,12 @@ def _resolve_weights(path: str) -> str:
     return candidates[0]  # missing: report the models/ path in the load error
 
 
-# Kaggle submission always runs the crustle v2 weights (the default). Local
+# Kaggle submission always runs the crustle v5 weights (the default). Local
 # tooling (e.g. local_test.py running an older export against itself) can point
 # this at a different file via the PPO_WEIGHTS env var without touching the
 # submission default.
 _weights_path = _resolve_weights(
-    os.environ.get("PPO_WEIGHTS", "ppo_crustle_v2_weights.npz")
+    os.environ.get("PPO_WEIGHTS", "ppo_crustle_v5_weights.npz")
 )
 _deck_path = os.path.join(_project_root, "deck.csv")
 
