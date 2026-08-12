@@ -27,9 +27,36 @@ DEFAULT_REWARD_MODULE = _crustle_rewards
 # into a model that must have the SAME arch -- so both import this one constant
 # to stay in lock-step. The enriched observation (see obs_vectorizer.py) is
 # wider and carries the card-semantic features the heuristic branches on, so a
-# 64x64 net is underpowered; 256x256 gives it room without materially slowing
-# CPU training (vectorization, not the forward pass, is the hot path here).
-POLICY_NET_ARCH = [256, 256]
+# 64x64 net is underpowered.
+#
+# [256, 256] -> [512, 512, 512]. From capacity_probe.py on bc_dataset.npz
+# (259,498 states, 85/15 split, 12 epochs, fixed seed), held-out action
+# accuracy by arch:
+#
+#     [64, 64]      440,834 params   0.6593 acc   0.3639 return R^2
+#     [256, 256]  1,861,250 params   0.6694 acc   0.3808          <- was
+#     [512, 512]  3,984,514 params   0.6743 acc   0.3831
+#     [1024,1024] 9,017,474 params   0.6831 acc   0.3955
+#     [512]*3     4,509,826 params   0.6924 acc   0.3840          <- now
+#
+# Depth buys more than width here: [512]*3 beats [1024, 1024] on accuracy with
+# half the parameters, the best accuracy-per-parameter of every arch tested.
+# This is a POLICY-capacity change only -- value R^2 barely moves (0.381 ->
+# 0.384) and saturates at ~0.38-0.40 across a 20x parameter range, so do NOT
+# reach for a wider net to chase train/explained_variance; the value head is
+# not what is capacity-limited.
+#
+# Two caveats on that table, both worth knowing before trusting it further:
+# capacity_probe.py is not checked into this repo, so the numbers are not
+# currently reproducible; and it was measured on bc_dataset.npz (the starmie
+# expert's states), NOT bc_dataset_crustle.npz, so the ranking is assumed to
+# transfer across decks rather than demonstrated to.
+#
+# Changing this forces `python -m training.bc_crustle` to be re-run before
+# BC_INIT will load (train.py's strict load_state_dict), and invalidates every
+# existing league snapshot -- SnapshotCallback clears that directory at
+# construction, so that part is handled automatically.
+POLICY_NET_ARCH = [512, 512, 512]
 
 
 def _load_deck(path=None):

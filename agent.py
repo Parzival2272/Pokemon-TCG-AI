@@ -24,9 +24,10 @@ once, so this wrapper produces it by looping the network internally -- feeding
 each pass the partial selection via obs_to_vector(obs_dict, picked=...) -- the
 same rollout CabtEnv performs across gym steps during training.
 
-Network shape (POLICY_NET_ARCH in training/cabt_env.py, currently [256, 256]);
-the layer widths are read off the loaded weights, so only the depth is fixed:
-    obs (VECTOR_SIZE,) -> Linear(.,H) -> Tanh -> Linear(H,H) -> Tanh
+Network shape (POLICY_NET_ARCH in training/cabt_env.py, currently
+[512, 512, 512]); both the widths AND the depth are read off the loaded
+weights, so this file does not need editing when the arch changes:
+    obs (VECTOR_SIZE,) -> [Linear -> Tanh] x n_layers
                        -> Linear(H, MAX_OPTIONS + 1) logits
 The chosen action is argmax over the currently-legal logits (masking is
 monotone-safe, so comparing raw logits matches comparing softmax probabilities).
@@ -81,9 +82,26 @@ with open(_deck_path) as _f:
 set_vectorizer_deck(deck)
 
 _w = np.load(_weights_path)
-_W0, _B0 = _w["w0"], _w["b0"]
-_W2, _B2 = _w["w2"], _w["b2"]
 _WA, _BA = _w["wa"], _w["ba"]
+
+# Hidden layers, as a list rather than a fixed _W0/_W2 pair, because
+# POLICY_NET_ARCH's DEPTH is not fixed (it is [512, 512, 512] as of this
+# writing, and was [256, 256] before).
+#
+# Two on-disk formats, told apart by the "n_layers" key:
+#   * current  -- w0/b0, w1/b1, ... w{n-1}/b{n-1}, plus n_layers. Consecutive
+#                 layer numbering, any depth.
+#   * legacy   -- w0/b0, w2/b2 only, where the numbers are raw indices into
+#                 SB3's policy_net Sequential (Linear at 0, Tanh at 1, Linear
+#                 at 2). Always exactly two hidden layers. This is what every
+#                 already-exported models/*_weights.npz is, including the
+#                 Kaggle default, so it has to keep working.
+if "n_layers" in _w.files:
+    _LAYERS = [(_w[f"w{i}"], _w[f"b{i}"]) for i in range(int(_w["n_layers"]))]
+else:
+    _LAYERS = [(_w["w0"], _w["b0"]), (_w["w2"], _w["b2"])]
+
+_W0 = _LAYERS[0][0]
 
 # Fail loudly if the weights don't match the current observation layout
 # (e.g. obs_vectorizer changed since the weights were exported).
@@ -118,9 +136,10 @@ def _predict(obs_dict: dict, n_options: int, min_count: int, max_count: int) -> 
     picked: list[int] = []
     while True:
         obs_vec = obs_to_vector(obs_dict, picked=picked)
-        h1 = np.tanh(obs_vec @ _W0.T + _B0)
-        h2 = np.tanh(h1 @ _W2.T + _B2)
-        logits = h2 @ _WA.T + _BA  # (MAX_OPTIONS + 1,)
+        h = obs_vec
+        for w, b in _LAYERS:
+            h = np.tanh(h @ w.T + b)
+        logits = h @ _WA.T + _BA  # (MAX_OPTIONS + 1,)
 
         # Legal-action mask, identical to CabtEnv.action_masks(): unpicked real
         # options while the selection isn't full, plus STOP once minCount met.
