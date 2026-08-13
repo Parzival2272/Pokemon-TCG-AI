@@ -73,7 +73,7 @@ _alakazam_v2_module.USE_SEARCH = os.environ.get("ALAKAZAM_V2_SEARCH") == "1"
 LEARNER_DECK_PATH = os.environ.get("DECK_PATH", DECK_PATH)
 # Name of the saved model. Overridable so a run on a different deck doesn't
 # overwrite the crustle model -- the previous hardcoded default is kept.
-MODEL_NAME = os.environ.get("MODEL_NAME", "ppo_crustle_v3")
+MODEL_NAME = os.environ.get("MODEL_NAME", "ppo_crustle_v6")
 _reward_module_name = os.environ.get("REWARD_MODULE")
 REWARD_MODULE = (
     importlib.import_module(_reward_module_name)
@@ -380,7 +380,7 @@ if __name__ == "__main__":
         model.policy.load_state_dict(params["policy"])
         print(f"Warm-started policy from {bc_init}")
 
-    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 25_000_000))
+    total_timesteps = int(os.environ.get("TOTAL_TIMESTEPS", 40_000_000))
     win_rate_cb = WinRateCallback()  # snapshot_cb was built above, before the envs
     reward_term_cb = RewardTermCallback()
 

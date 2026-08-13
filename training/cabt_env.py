@@ -27,36 +27,44 @@ DEFAULT_REWARD_MODULE = _crustle_rewards
 # into a model that must have the SAME arch -- so both import this one constant
 # to stay in lock-step. The enriched observation (see obs_vectorizer.py) is
 # wider and carries the card-semantic features the heuristic branches on, so a
-# 64x64 net is underpowered.
+# 64x64 net is underpowered; 256x256 gives it room without materially slowing
+# CPU training (vectorization, not the forward pass, is the hot path here).
 #
-# [256, 256] -> [512, 512, 512]. From capacity_probe.py on bc_dataset.npz
-# (259,498 states, 85/15 split, 12 epochs, fixed seed), held-out action
-# accuracy by arch:
+# DO NOT "upgrade" this to [512, 512, 512] without re-reading the next
+# paragraph -- that experiment has already been run, on this deck, and it
+# bought nothing.
 #
-#     [64, 64]      440,834 params   0.6593 acc   0.3639 return R^2
-#     [256, 256]  1,861,250 params   0.6694 acc   0.3808          <- was
-#     [512, 512]  3,984,514 params   0.6743 acc   0.3831
-#     [1024,1024] 9,017,474 params   0.6831 acc   0.3955
-#     [512]*3     4,509,826 params   0.6924 acc   0.3840          <- now
+# capacity_probe.py (on bc_dataset.npz: 259,498 states, 85/15 split, 12 epochs)
+# predicted held-out action accuracy 0.6694 -> 0.6924 for [512]*3, and
+# training/train_v17.py.patch.md proposed the change on that basis. Measured
+# directly on THIS deck's data instead -- bc_dataset_crustle.npz, both BC
+# checkpoints scored on the identical seed-0 holdout of 17,795 samples:
 #
-# Depth buys more than width here: [512]*3 beats [1024, 1024] on accuracy with
-# half the parameters, the best accuracy-per-parameter of every arch tested.
-# This is a POLICY-capacity change only -- value R^2 barely moves (0.381 ->
-# 0.384) and saturates at ~0.38-0.40 across a 20x parameter range, so do NOT
-# reach for a wider net to chase train/explained_variance; the value head is
-# not what is capacity-limited.
+#     [256, 256]       3,040,898 params   val action accuracy 0.7124
+#     [512, 512, 512]  6,869,122 params   val action accuracy 0.7127
 #
-# Two caveats on that table, both worth knowing before trusting it further:
-# capacity_probe.py is not checked into this repo, so the numbers are not
-# currently reproducible; and it was measured on bc_dataset.npz (the starmie
-# expert's states), NOT bc_dataset_crustle.npz, so the ranking is assumed to
-# transfer across decks rather than demonstrated to.
+# +0.0003, i.e. five held-out samples, for 2.26x the parameters. The probe's
+# predicted +2.3 points did not transfer across decks -- it was measured on the
+# STARMIE expert's states, not this list's. Measured cost of the change was
+# real: one PPO update went 8.18s -> 20.89s (2.55x), roughly 12h vs 8.7h for
+# 25M steps.
+#
+# The value head is separately known NOT to be capacity-limited (return R^2
+# saturates at ~0.38-0.40 across a 20x parameter range), so do not reach for a
+# wider net to chase train/explained_variance either.
+#
+# Caveat, in fairness to a future attempt: BC accuracy measures how well the
+# net imitates the heuristic, not PPO's ceiling once it is trying to EXCEED
+# the expert. If you retry, the honest test is a matched PPO A/B, not a BC
+# probe -- and budget for the 2.55x update cost. Archived artifacts from the
+# attempt: ppo_crustle_bc_512x3.zip (BC at that arch) and
+# ppo_crustle_bc_256x2.zip (this arch).
 #
 # Changing this forces `python -m training.bc_crustle` to be re-run before
 # BC_INIT will load (train.py's strict load_state_dict), and invalidates every
 # existing league snapshot -- SnapshotCallback clears that directory at
 # construction, so that part is handled automatically.
-POLICY_NET_ARCH = [512, 512, 512]
+POLICY_NET_ARCH = [256, 256]
 
 
 def _load_deck(path=None):

@@ -24,9 +24,9 @@ once, so this wrapper produces it by looping the network internally -- feeding
 each pass the partial selection via obs_to_vector(obs_dict, picked=...) -- the
 same rollout CabtEnv performs across gym steps during training.
 
-Network shape (POLICY_NET_ARCH in training/cabt_env.py, currently
-[512, 512, 512]); both the widths AND the depth are read off the loaded
-weights, so this file does not need editing when the arch changes:
+Network shape (POLICY_NET_ARCH in training/cabt_env.py, currently [256, 256]);
+both the widths AND the depth are read off the loaded weights, so this file
+does not need editing when the arch changes:
     obs (VECTOR_SIZE,) -> [Linear -> Tanh] x n_layers
                        -> Linear(H, MAX_OPTIONS + 1) logits
 The chosen action is argmax over the currently-legal logits (masking is
@@ -85,8 +85,11 @@ _w = np.load(_weights_path)
 _WA, _BA = _w["wa"], _w["ba"]
 
 # Hidden layers, as a list rather than a fixed _W0/_W2 pair, because
-# POLICY_NET_ARCH's DEPTH is not fixed (it is [512, 512, 512] as of this
-# writing, and was [256, 256] before).
+# POLICY_NET_ARCH's DEPTH is not something this file should assume. It is
+# [256, 256] as of this writing, but a [512, 512, 512] run has already been
+# tried once, and the old fixed-pair version did not fail on it -- it silently
+# read the first two layers of a three-layer export and played as a different
+# network. Keep this general even while the arch is two layers deep.
 #
 # Two on-disk formats, told apart by the "n_layers" key:
 #   * current  -- w0/b0, w1/b1, ... w{n-1}/b{n-1}, plus n_layers. Consecutive
